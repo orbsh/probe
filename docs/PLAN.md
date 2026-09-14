@@ -5,7 +5,7 @@ Design lives in the wiki (stateless-agent-architecture.md); this file only seque
 ## Milestone A — Runtime
 
 - [x] Phase 0 — Workspace skeleton: `crates/{runtime,protocol,config}`; task contract (tool_call in → tool_result out); capability surface definition (fs scope, command exec, network — what a skill may touch; no credentials). Isolation model: **the Probe itself runs as a container** (base image + on-demand dependency install, e.g. Python + libs) — isolation is per-node, not per-skill. Consequence stated openly: skills inside one container share its filesystem; the "restricted world" is enforced by the capability surface (app-layer checks), not by container boundaries. Acceptable under user-namespace isolation (isolation cuts by user, not by skill); revisit per-skill isolation only if multi-tenant shared nodes become real.
-- [ ] Phase 1 — Runtime carriers: koto / rune / steel / wasmer / wasmtime / wasmi, feature-gated (carried over from krystallizer's vm crate); per-skill language declaration; script-only skills end-to-end.
+- [x] Phase 1 — Runtime carriers: steel / python (PyO3) / wasmtime (the Wasm engine; wasmer/wasmi were engine candidates, not languages; koto/rune predate the three-language ruling and are dropped) + nushell (subprocess, CGI-shaped: JSON via stdin, structured result via stdout — completes the language-selection quadrant grid), feature-gated; per-operation language declaration; script-only operations end-to-end.
 
 ## Milestone B — Actuator
 

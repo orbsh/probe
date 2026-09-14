@@ -9,3 +9,14 @@ probe-protocol = { path = "../protocol" }
 probe-config = { path = "../config" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+anyhow = "1"
+steel-core = { version = "0.7", optional = true }
+pyo3 = { version = "0.25", optional = true, features = ["auto-initialize"] }
+wasmtime = { version = "34", optional = true }
+
+[features]
+default = ["steel"]
+steel = ["dep:steel-core"]
+python = ["dep:pyo3"]
+wasmtime = ["dep:wasmtime"]
+nushell = []
