@@ -2,6 +2,11 @@
 
 Skill runtime / remote actuator of the stateless agent architecture. Design: [stateless-agent-architecture.md](../../.hermes/wiki/stateless-agent-architecture.md) (wiki), Gravity (turn executor), Krystallizer (skill graph).
 
+**Upstream-agnostic by iron rule**: probe never depends on Aura crates — all
+coupling with Aura is the frame protocol (serde types in `probe-protocol`).
+Any service that speaks the frames can drive it; the Aura Actor deployment
+form lives entirely on the Aura side (connection-plane adapter).
+
 ## Model
 
 Execution only — provides a runtime environment, never lives in Krystallizer. Container-isolated; skill code is untrusted.

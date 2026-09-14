@@ -2,6 +2,16 @@
 
 Design lives in the wiki (stateless-agent-architecture.md); this file only sequences phases.
 
+**Iron rule — probe never depends on Aura crates.** All coupling with Aura is
+limited to the frame protocol (serde types in `probe-protocol`). The probe is
+upstream-agnostic: any service that speaks the frames can drive it — the
+"Aura Actor" deployment form is implemented entirely on the Aura side
+(connection plane adapts outbound WS frames to Realm mailbox semantics);
+scheduling semantics the probe needs (same-node seriality, call timeout) are
+its own mailbox + deadline, not Aura's `pending_calls` — that scan is
+control-plane side. Hitching to another service = that service holds the WS
+server; probe code is unchanged.
+
 ## Milestone A — Runtime
 
 - [x] Phase 0 — Workspace skeleton: `crates/{runtime,protocol,config}`; task contract (tool_call in → tool_result out); capability surface definition (fs scope, command exec, network — what a skill may touch; no credentials). Isolation model: **the Probe itself runs as a container** (base image + on-demand dependency install, e.g. Python + libs) — isolation is per-node, not per-skill. Consequence stated openly: skills inside one container share its filesystem; the "restricted world" is enforced by the capability surface (app-layer checks), not by container boundaries. Acceptable under user-namespace isolation (isolation cuts by user, not by skill); revisit per-skill isolation only if multi-tenant shared nodes become real.
