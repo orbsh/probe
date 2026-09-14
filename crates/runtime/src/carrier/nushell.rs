@@ -15,7 +15,6 @@
 //! - the return value is structured; `to json --raw` serializes it
 
 use super::{ExecRequest, ExecResult};
-use serde_json::Value;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 

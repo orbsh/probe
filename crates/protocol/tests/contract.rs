@@ -5,25 +5,15 @@ fn roundtrip_inline_call() {
     let call = ToolCall {
         call_id: "c1".into(),
         tool: "probe:home-pc:read_file".into(),
+        language: "nushell".into(),
         args: serde_json::json!({ "path": "~/notes.md" }),
-        code: Some(CodePayload::Inline { bytes: b"print(1)".to_vec() }),
+        code: CodePayload::Inline { bytes: b"print(1)".to_vec() },
     };
     let s = serde_json::to_string(&call).unwrap();
     let back: ToolCall = serde_json::from_str(&s).unwrap();
     assert_eq!(back.call_id, "c1");
-    assert!(matches!(back.code, Some(CodePayload::Inline { .. })));
-}
-
-#[test]
-fn native_operation_has_no_code() {
-    let call = ToolCall {
-        call_id: "c2".into(),
-        tool: "probe:home-pc:read_file".into(),
-        args: serde_json::json!({ "path": "~/notes.md" }),
-        code: None,
-    };
-    let s = serde_json::to_string(&call).unwrap();
-    assert!(!s.contains("skill"));
+    assert_eq!(back.language, "nushell");
+    assert!(matches!(back.code, CodePayload::Inline { .. }));
 }
 
 #[test]
