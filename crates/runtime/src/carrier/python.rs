@@ -1,15 +1,41 @@
 //! Python carrier (PyO3, in-process CPython, zero IPC).
 
-use super::{ExecRequest, ExecResult};
+use super::{ExecRequest, ExecResult, HostFn};
 use std::ffi::CString;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
+use pyo3::types::{PyAny, PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
 use serde_json::Value;
 
 pub fn execute(req: ExecRequest) -> ExecResult {
     Python::with_gil(|py| -> ExecResult {
         let module = PyModule::from_code(py, &CString::new(req.source)?, c"operation.py", c"operation")
             .map_err(|e| anyhow::anyhow!("python load: {e}"))?;
+
+        // Expose each host function as a module-level callable taking one
+        // JSON string and returning the parsed JSON value. PyCFunction over
+        // a Rust closure keeps the marshal at the boundary — no code-gen.
+        if let Some(bridge) = req.host {
+            for (name, f) in &bridge.functions {
+                let f: HostFn = f.clone();
+                let call = PyCFunction::new_closure(py, None, None, move |args, _kw| {
+                    let raw: String = args
+                        .get_item(0)?
+                        .extract()?;
+                    // We already hold the GIL (running inside a Python call);
+                    // unsafe-assert it to detach the result's lifetime from
+                    // the closure args.
+                    let py = unsafe { Python::assume_gil_acquired() };
+                    // The script passes a JSON string; decode it so the host
+                    // fn sees the structured value (marshal at boundary).
+                    let decoded: Value = serde_json::from_str(&raw)
+                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("host arg not JSON: {e}")))?;
+                    let out = (f)(decoded)
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    Ok::<_, pyo3::PyErr>(json_to_py(py, &out)?.unbind())
+                })?;
+                module.add(name.as_str(), call)?;
+            }
+        }
 
         let args_py = json_to_py(py, req.args)?;
 

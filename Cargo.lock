@@ -1225,6 +1225,7 @@ name = "probe-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "im-rc",
  "probe-config",
  "probe-protocol",
  "pyo3",

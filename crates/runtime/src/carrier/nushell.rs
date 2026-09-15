@@ -30,6 +30,15 @@ pub fn execute(req: ExecRequest) -> ExecResult {
         );
     }
 
+    // Subprocess execution cannot call back into the host — keep the
+    // contract honest: script actors needing ctx use an in-process carrier.
+    if req.host.is_some() {
+        anyhow::bail!(
+            "nushell carrier cannot reach host functions (subprocess execution); \
+             script actors needing ctx must use an in-process carrier"
+        );
+    }
+
     let which = Command::new("nu").arg("--version").output();
     if which.is_err() {
         anyhow::bail!("nushell not found in PATH: the node does not carry the nu carrier");

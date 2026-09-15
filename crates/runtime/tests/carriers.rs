@@ -17,7 +17,7 @@ fn py_entry_with_args() {
     let src = "def execute(args):\n    return {\"doubled\": args[\"x\"] * 2}\n";
     let out = execute(
         "python",
-        ExecRequest { source: src, entry: Some("execute"), args: &args },
+        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
     )
     .unwrap();
     assert_eq!(out, serde_json::json!({"doubled": 42}));
@@ -31,7 +31,7 @@ fn py_result_binding() {
     let src = "result = [1, 2, 3]\n";
     let out = execute(
         "python",
-        ExecRequest { source: src, entry: None, args: &args },
+        ExecRequest { source: src, entry: None, args: &args, host: None },
     )
     .unwrap();
     assert_eq!(out, serde_json::json!([1, 2, 3]));
@@ -44,7 +44,7 @@ fn py_missing_entry_is_error_value() {
     let args = serde_json::json!(null);
     let err = execute(
         "python",
-        ExecRequest { source: "x = 1\n", entry: Some("nope"), args: &args },
+        ExecRequest { source: "x = 1\n", entry: Some("nope"), args: &args, host: None },
     )
     .unwrap_err();
     assert!(err.to_string().contains("nope"));
@@ -65,7 +65,7 @@ export def execute [args] {
 "#;
     let out = execute(
         "nushell",
-        ExecRequest { source: src, entry: Some("execute"), args: &args },
+        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
     )
     .unwrap();
     assert_eq!(out, serde_json::json!({"doubled": 42}));
@@ -83,7 +83,7 @@ export def execute [args] {
 "#;
     let out = execute(
         "nushell",
-        ExecRequest { source: src, entry: Some("execute"), args: &args },
+        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
     )
     .unwrap();
     assert_eq!(out, serde_json::json!([1, 2, 3]));
@@ -97,7 +97,7 @@ fn nu_rejects_main_entry() {
     let args = serde_json::json!(null);
     let err = execute(
         "nushell",
-        ExecRequest { source: "export def main [] {}", entry: Some("main"), args: &args },
+        ExecRequest { source: "export def main [] {}", entry: Some("main"), args: &args, host: None },
     )
     .unwrap_err();
     assert!(err.to_string().contains("named function"));
@@ -116,7 +116,7 @@ fn steel_entry_with_args() {
 "#;
     let out = execute(
         "steel",
-        ExecRequest { source: src, entry: Some("execute"), args: &args },
+        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
     )
     .unwrap();
     assert_eq!(out, serde_json::json!("x=2"));
@@ -133,6 +133,7 @@ fn steel_result_binding() {
             source: "(define *result* (* 6 7))",
             entry: None,
             args: &args,
+            host: None,
         },
     )
     .unwrap();
@@ -147,7 +148,7 @@ fn unknown_language_is_error_value() {
     let args = serde_json::json!(null);
     let err = execute(
         "koto",
-        ExecRequest { source: "(+ 1 2)", entry: None, args: &args },
+        ExecRequest { source: "(+ 1 2)", entry: None, args: &args, host: None },
     )
     .unwrap_err();
     assert!(err.to_string().contains("koto"));

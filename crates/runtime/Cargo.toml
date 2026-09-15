@@ -11,12 +11,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
 steel-core = { version = "0.7", optional = true }
+im-rc = { version = "15.1.0", optional = true }
 pyo3 = { version = "0.25", optional = true, features = ["auto-initialize"] }
 wasmtime = { version = "34", optional = true }
 
 [features]
 default = ["steel"]
-steel = ["dep:steel-core"]
+steel = ["dep:steel-core", "dep:im-rc"]
 python = ["dep:pyo3"]
 wasmtime = ["dep:wasmtime"]
 nushell = []
