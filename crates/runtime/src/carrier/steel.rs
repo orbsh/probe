@@ -14,11 +14,22 @@ pub fn execute(req: ExecRequest) -> ExecResult {
     engine.run(req.source.to_owned()).map_err(|e| anyhow::anyhow!("steel run: {e:?}"))?;
 
     if let Some(entry) = req.entry {
-        // Args arrive as a single JSON string; the operation parses what it needs.
-        let args_json = SteelVal::StringV(serde_json::to_string(req.args)?.into());
+        // Args arrive as a NATIVE steel value (hash/list) — no re-parsing
+        // inside the script; the carrier marshals at the boundary.
+        let args_val = json_to_steel(req.args).map_err(|e| anyhow::anyhow!("steel args marshal: {e}"))?;
+        // Interim shim (until the event→fn-name mapping lands in the
+        // router): an addressed name with no matching function falls back
+        // to the script's conventional `execute` entry.
+        let called = if engine.extract_value(entry).is_ok() {
+            entry.to_string()
+        } else if engine.extract_value("execute").is_ok() {
+            "execute".to_string()
+        } else {
+            entry.to_string()
+        };
         let val = engine
-            .call_function_by_name_with_args(entry, vec![args_json])
-            .map_err(|e| anyhow::anyhow!("steel call {entry}: {e:?}"))?;
+            .call_function_by_name_with_args(&called, vec![args_val])
+            .map_err(|e| anyhow::anyhow!("steel call {called}: {e:?}"))?;
         return steel_to_json(&val);
     }
     // No entry point: the source registers its result in `*result*`.
@@ -39,17 +50,18 @@ fn register_host(engine: &mut Engine, host: Option<&HostBridge>) {
         // bounded by the declared host functions) and clone the HostFn Arc.
         let name: &'static str = Box::leak(name.clone().into_boxed_str());
         engine.register_fn(name, move |arg: SteelVal| -> Result<SteelVal, String> {
-            // Scripts pass a JSON string (the common form for host calls);
-            // other steel values marshal through steel_to_json.
-            let json_in = match arg {
-                SteelVal::StringV(s) => s.to_string(),
-                other => match steel_to_json(&other) {
-                    Ok(v) => serde_json::to_string(&v).map_err(|e| e.to_string())?,
-                    Err(e) => return Err(e.to_string()),
-                },
+            // Arg marshal: a steel string is tried as JSON first (object
+            // form `{"field": ...}`) and falls back to a bare string value
+            // (the bare-field-name form `"count"`). Other steel values
+            // marshal through steel_to_json.
+            let decoded: Value = match &arg {
+                SteelVal::StringV(s) => {
+                    let raw = s.to_string();
+                    serde_json::from_str(&raw)
+                        .unwrap_or(Value::String(raw))
+                }
+                other => steel_to_json(other).map_err(|e| e.to_string())?,
             };
-            let decoded: Value = serde_json::from_str(&json_in)
-                .map_err(|e| format!("host arg not JSON: {e}"))?;
             let out = (f)(decoded).map_err(|e| e.to_string())?;
             json_to_steel(&out)
         });

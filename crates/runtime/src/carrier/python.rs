@@ -130,8 +130,18 @@ pub fn execute(req: ExecRequest) -> ExecResult {
 
         let result = match req.entry {
             Some(entry) => {
-                let func = module.getattr(entry).map_err(|e| anyhow::anyhow!("python entry {entry}: {e}"))?;
-                func.call1((args_py,)).map_err(|e| anyhow::anyhow!("python call {entry}: {e}"))?
+                // Interim shim (until event→fn-name mapping lands in the
+                // router): an addressed name with no matching function
+                // falls back to the script's conventional `execute` entry.
+                let name = match module.getattr(entry) {
+                    Ok(_) => entry.to_string(),
+                    // Fall back only when `execute` exists; otherwise the
+                    // missing entry stays an error.
+                    Err(_) if module.getattr("execute").is_ok() => "execute".to_string(),
+                    Err(e) => return Err(anyhow::anyhow!("python entry {entry}: {e}")),
+                };
+                let func = module.getattr(&name).map_err(|e| anyhow::anyhow!("python entry {name}: {e}"))?;
+                func.call1((args_py,)).map_err(|e| anyhow::anyhow!("python call {name}: {e}"))?
             }
             // No entry point: the script sets a module-level `result`
             // variable during import-time execution.
