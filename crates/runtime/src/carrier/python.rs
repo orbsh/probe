@@ -6,9 +6,98 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
 use serde_json::Value;
 
+/// Compile `source` and execute it at import time with the `@on` collector
+/// already bound — decorators append `(event, key)` pairs to the returned
+/// registry while the module body runs. The collector is language-shape
+/// (a declaration registry); deriving schema semantics from it is the
+/// caller's (aura's) job.
+fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyModule>, Bound<'py, PyList>)> {
+    let module = PyModule::new(py, "operation")?;
+    let registry = PyList::empty(py);
+    let reg: Py<PyList> = registry.clone().unbind();
+    let on = PyCFunction::new_closure(py, None, None, move |args, kw| {
+        let py = unsafe { Python::assume_gil_acquired() };
+        let reg = reg.bind(py);
+        // Two call shapes: `on("event", key=...)` (declaration — returns an
+        // identity decorator) and `decorator(fn)` (application — returns
+        // the function unchanged).
+        let first = args.get_item(0)?;
+        if first.extract::<String>().is_ok() {
+            let mut key = String::new();
+            if let Some(kw) = kw {
+                if let Some(k) = kw.get_item("key")? {
+                    key = k.extract()?;
+                }
+            }
+            reg.append((first.extract::<String>()?, key))?;
+            let identity = PyCFunction::new_closure(py, None, None, |a: &Bound<'_, pyo3::types::PyTuple>, _kw: Option<&Bound<'_, pyo3::types::PyDict>>| {
+                Ok::<_, pyo3::PyErr>(a.get_item(0)?.unbind())
+            })?;
+            Ok::<_, pyo3::PyErr>(identity.into_any().unbind())
+        } else {
+            Ok::<_, pyo3::PyErr>(first.unbind())
+        }
+    })?;
+    module.add("on", on)?;
+    // Execute the module body with the module dict as globals so the
+    // decorators resolve `on` (bound above, before the body runs).
+    let globals = module.dict();
+    globals.set_item("__name__", "operation")?;
+    py.run(CString::new(source)?.as_c_str(), Some(&globals), None)?;
+    // Assemble the merged `interface_schema` AFTER the body ran. Captures:
+    // the registry (decorator declarations) + the script's explicit partial
+    // schema, if it declared one. Field-wise merge: derived
+    // receives/wildcard_receives + whatever the explicit half adds
+    // (lifecycle, ...). One `interface_schema` name on the module either
+    // way — aura's call path is uniform across languages.
+    let reg_handle: Py<PyList> = registry.clone().unbind();
+    let explicit_fn: Option<Py<PyAny>> = module
+        .getattr("interface_schema")
+        .ok()
+        .map(|f| f.unbind());
+    let merge = PyCFunction::new_closure(py, None, None, move |_args, _kw| {
+        let py = unsafe { Python::assume_gil_acquired() };
+        let reg = reg_handle.bind(py);
+        // Derived half from the @on registry: [(event, key), ...].
+        let mut receives = serde_json::Map::new();
+        let mut wildcards: Vec<Value> = Vec::new();
+        for item in reg.iter() {
+            let pair: (String, String) = match item.extract() {
+                Ok(p) => p,
+                Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("@on registry entry: {e}"))),
+            };
+            if pair.0.ends_with(".*") {
+                wildcards.push(Value::String(pair.0));
+                continue;
+            }
+            let mut entry = serde_json::Map::new();
+            if !pair.1.is_empty() {
+                entry.insert("key".into(), Value::String(pair.1));
+            }
+            receives.insert(pair.0, Value::Object(entry));
+        }
+        let derived = Value::Object([
+            ("receives".to_string(), Value::Object(receives)),
+            ("wildcard_receives".to_string(), Value::Array(wildcards)),
+        ].into_iter().collect());
+        // Explicit half: call the script's captured declaration, if any.
+        let mut merged = derived.clone();
+        if let Some(f) = &explicit_fn {
+            let r = f.bind(py).call1((py.None(),))
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("interface_schema: {e}")))?;
+            let explicit_v = json_from_py(py, &r)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            merged = merge_schema(derived.clone(), explicit_v);
+        }
+        json_to_py(py, &merged).map(|v| v.unbind())
+    })?;
+    module.add("interface_schema", merge)?;
+    Ok((module, registry))
+}
+
 pub fn execute(req: ExecRequest) -> ExecResult {
     Python::with_gil(|py| -> ExecResult {
-        let module = PyModule::from_code(py, &CString::new(req.source)?, c"operation.py", c"operation")
+        let (module, _registry) = load_module(py, req.source)
             .map_err(|e| anyhow::anyhow!("python load: {e}"))?;
 
         // Expose each host function as a module-level callable taking one
@@ -53,6 +142,47 @@ pub fn execute(req: ExecRequest) -> ExecResult {
 
         json_from_py(py, &result)
     })
+}
+
+/// Upload-time introspection: load the module once (load discarded after),
+/// call the module's `interface_schema` — one function, one call path for
+/// aura. The module assembles it at import: the implicit (decorator-derived)
+/// half merges with the script's explicit partial declaration (which may
+/// add lifecycle etc.). Same call contract as steel/nushell/wasm.
+pub fn introspect(source: &str) -> ExecResult {
+    Python::with_gil(|py| -> ExecResult {
+        let (module, _registry) = load_module(py, source)
+            .map_err(|e| anyhow::anyhow!("python load: {e}"))?;
+        let schema_fn = module
+            .getattr("interface_schema")
+            .map_err(|e| anyhow::anyhow!("python: no interface_schema (carrier assembles it) — {e}"))?;
+        let result = schema_fn
+            .call1((py.None(),))
+            .map_err(|e| anyhow::anyhow!("python interface_schema: {e}"))?;
+        json_from_py(py, &result)
+    })
+}
+
+/// Field-wise schema merge: the explicit (script-written) declaration
+/// fills keys the derived (decorator) half does not set; derived
+/// receives/wildcard_receives win on their own keys — the decorators are
+/// the authoritative source for receives, the explicit half contributes
+/// everything else (lifecycle, ...).
+fn merge_schema(derived: Value, explicit: Value) -> Value {
+    let mut out = match (derived, explicit) {
+        (Value::Object(mut d), Value::Object(e)) => {
+            for (k, v) in e {
+                d.entry(k).or_insert(v);
+            }
+            Value::Object(d)
+        }
+        (d, Value::Object(e)) if e.is_empty() => d,
+        (d, e) => e.is_null().then_some(d).unwrap_or(e),
+    };
+    // Deep-merge the receives maps: explicit receives entries that the
+    // decorators did not declare still contribute (the script may know a
+    // receive the decorators cannot express).
+    out
 }
 
 fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
