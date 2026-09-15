@@ -10,6 +10,7 @@ use steel::steel_vm::register_fn::RegisterFn;
 pub fn execute(req: ExecRequest) -> ExecResult {
     let mut engine = Engine::new();
     register_host(&mut engine, req.host);
+    register_on_collector(&mut engine);
     engine.run(req.source.to_owned()).map_err(|e| anyhow::anyhow!("steel run: {e:?}"))?;
 
     if let Some(entry) = req.entry {
@@ -110,4 +111,82 @@ fn steel_to_json(v: &SteelVal) -> ExecResult {
         other => anyhow::bail!("unsupported steel return type: {other:?}"),
     };
     Ok(out)
+}
+
+/// Event-declaration collector, bound before the source runs: `(on "event"
+/// "key" handler)` records (event, key) into a shared list and returns the
+/// handler unchanged. Language-shape only; schema semantics are aura's.
+fn register_on_collector(engine: &mut Engine) {
+    let declarations: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Default::default();
+    let decl = declarations.clone();
+    engine.register_fn("on", move |event: String, key: String, handler: SteelVal| -> Result<SteelVal, String> {
+        decl.lock().unwrap().push((event, key));
+        Ok(handler)
+    });
+    let _ = declarations;
+}
+
+/// Upload-time introspection: run the source once in a fresh VM (load
+/// discarded after) with the `on` collector bound, call the script's
+/// `interface_schema` if it wrote one, and merge field-wise with the
+/// collector-derived half. One name, one call — uniform with python.
+pub fn introspect(source: &str) -> ExecResult {
+    let mut engine = Engine::new();
+    let declarations: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Default::default();
+    let decl = declarations.clone();
+    engine.register_fn("on", move |event: String, key: String, handler: SteelVal| -> Result<SteelVal, String> {
+        decl.lock().unwrap().push((event, key));
+        Ok(handler)
+    });
+    engine
+        .run(source.to_owned())
+        .map_err(|e| anyhow::anyhow!("steel load: {e:?}"))?;
+
+    // Derived half from the collected declarations.
+    let mut receives = serde_json::Map::new();
+    let mut wildcards: Vec<Value> = Vec::new();
+    for (event, key) in declarations.lock().unwrap().iter() {
+        if event.ends_with(".*") {
+            wildcards.push(Value::String(event.clone()));
+            continue;
+        }
+        let mut entry = serde_json::Map::new();
+        if !key.is_empty() {
+            entry.insert("key".into(), Value::String(key.clone()));
+        }
+        receives.insert(event.clone(), Value::Object(entry));
+    }
+    let derived = Value::Object([
+        ("receives".to_string(), Value::Object(receives)),
+        ("wildcard_receives".to_string(), Value::Array(wildcards)),
+    ].into_iter().collect());
+
+    // Explicit half: the script's own interface_schema, if it wrote one.
+    let explicit: Option<Value> = match engine
+        .call_function_by_name_with_args("interface_schema", vec![SteelVal::StringV("{}".into())])
+    {
+        Ok(v) => Some(steel_to_json(&v)?),
+        Err(_) => None,
+    };
+
+    Ok(match explicit {
+        Some(e) => merge_schema(derived, e),
+        None => derived,
+    })
+}
+
+/// Field-wise merge: the derived (collector) half wins on its keys;
+/// the explicit half contributes everything else (lifecycle, ...).
+fn merge_schema(derived: Value, explicit: Value) -> Value {
+    match (derived, explicit) {
+        (Value::Object(mut d), Value::Object(e)) => {
+            for (k, v) in e {
+                d.entry(k).or_insert(v);
+            }
+            Value::Object(d)
+        }
+        (d, _) => d,
+    }
 }

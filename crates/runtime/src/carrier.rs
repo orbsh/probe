@@ -61,3 +61,26 @@ pub fn execute(language: &str, req: ExecRequest) -> anyhow::Result<Value> {
     }
 }
 
+/// Upload-time introspection, dispatched per language. Every carrier
+/// assembles/merges `interface_schema` behind this one call — the host
+/// never knows how each language collects its declarations.
+pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
+    match language {
+        #[cfg(feature = "steel")]
+        "steel" => steel::introspect(source),
+        #[cfg(feature = "python")]
+        "python" => python::introspect(source),
+        // Languages without collectors: the script hand-writes the whole
+        // `interface_schema` — the generic entry call covers them.
+        _ => execute(
+            language,
+            ExecRequest {
+                source,
+                entry: Some("interface_schema"),
+                args: &Value::Null,
+                host: None,
+            },
+        ),
+    }
+}
+
