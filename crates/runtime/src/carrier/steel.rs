@@ -12,6 +12,10 @@ pub fn execute(req: ExecRequest) -> ExecResult {
     register_host(&mut engine, req.host);
     register_on_collector(&mut engine);
     engine.run(req.source.to_owned()).map_err(|e| anyhow::anyhow!("steel run: {e:?}"))?;
+    // Bind each collected handler under its EVENT NAME (register_value —
+    // dotted names are fine: env lookup is by string, not by parser ident).
+    // Event delivery addresses handlers by event name.
+    bind_event_handlers(&mut engine);
 
     if let Some(entry) = req.entry {
         // Args arrive as a NATIVE steel value (hash/list) — no re-parsing
@@ -125,18 +129,43 @@ fn steel_to_json(v: &SteelVal) -> ExecResult {
     Ok(out)
 }
 
+thread_local! {
+    /// (event, key, handler) declarations collected by `on` during the
+    /// body run. Thread-local because SteelVal carries Rc internals (not
+    /// Send) and register_fn closures must be Send — the whole execution
+    /// (VM + builtins) stays on one thread, so thread-local is exact.
+    static DECLARATIONS: std::cell::RefCell<Vec<(String, String, SteelVal)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Event-declaration collector, bound before the source runs: `(on "event"
-/// "key" handler)` records (event, key) into a shared list and returns the
-/// handler unchanged. Language-shape only; schema semantics are aura's.
+/// "key" handler)` records the declaration and returns the handler
+/// unchanged. Language-shape only; schema semantics are aura's.
 fn register_on_collector(engine: &mut Engine) {
-    let declarations: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
-        Default::default();
-    let decl = declarations.clone();
-    engine.register_fn("on", move |event: String, key: String, handler: SteelVal| -> Result<SteelVal, String> {
-        decl.lock().unwrap().push((event, key));
+    DECLARATIONS.with(|d| d.borrow_mut().clear());
+    engine.register_fn("on", |event: String, key: String, handler: SteelVal| -> Result<SteelVal, String> {
+        DECLARATIONS.with(|d| d.borrow_mut().push((event, key, handler.clone())));
         Ok(handler)
     });
-    let _ = declarations;
+}
+
+/// Bind collected handlers under their event names (register_value —
+/// dotted names are fine: env lookup is by string, not parser ident).
+fn bind_event_handlers(engine: &mut Engine) {
+    DECLARATIONS.with(|d| {
+        for (event, _key, handler) in d.borrow().iter() {
+            engine.register_value(event, handler.clone());
+        }
+    });
+}
+
+fn collected() -> Vec<(String, String)> {
+    DECLARATIONS.with(|d| {
+        d.borrow()
+            .iter()
+            .map(|(e, k, _)| (e.clone(), k.clone()))
+            .collect()
+    })
 }
 
 /// Upload-time introspection: run the source once in a fresh VM (load
@@ -145,21 +174,16 @@ fn register_on_collector(engine: &mut Engine) {
 /// collector-derived half. One name, one call — uniform with python.
 pub fn introspect(source: &str) -> ExecResult {
     let mut engine = Engine::new();
-    let declarations: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
-        Default::default();
-    let decl = declarations.clone();
-    engine.register_fn("on", move |event: String, key: String, handler: SteelVal| -> Result<SteelVal, String> {
-        decl.lock().unwrap().push((event, key));
-        Ok(handler)
-    });
+    register_on_collector(&mut engine);
     engine
         .run(source.to_owned())
         .map_err(|e| anyhow::anyhow!("steel load: {e:?}"))?;
+    let declarations = collected();
 
     // Derived half from the collected declarations.
     let mut receives = serde_json::Map::new();
     let mut wildcards: Vec<Value> = Vec::new();
-    for (event, key) in declarations.lock().unwrap().iter() {
+    for (event, key) in declarations.iter() {
         if event.ends_with(".*") {
             wildcards.push(Value::String(event.clone()));
             continue;

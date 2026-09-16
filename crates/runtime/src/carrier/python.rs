@@ -15,6 +15,7 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
     let module = PyModule::new(py, "operation")?;
     let registry = PyList::empty(py);
     let reg: Py<PyList> = registry.clone().unbind();
+    let module_handle: Py<PyModule> = module.clone().unbind();
     let on = PyCFunction::new_closure(py, None, None, move |args, kw| {
         let py = unsafe { Python::assume_gil_acquired() };
         let reg = reg.bind(py);
@@ -29,11 +30,20 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
                     key = k.extract()?;
                 }
             }
-            reg.append((first.extract::<String>()?, key))?;
-            let identity = PyCFunction::new_closure(py, None, None, |a: &Bound<'_, pyo3::types::PyTuple>, _kw: Option<&Bound<'_, pyo3::types::PyDict>>| {
-                Ok::<_, pyo3::PyErr>(a.get_item(0)?.unbind())
+            let event = first.extract::<String>()?;
+            reg.append((event.clone(), key))?;
+            // The returned decorator binds the function under the EVENT
+            // NAME — event delivery addresses handlers by event name, so
+            // the module must expose them there. The module handle is
+            // captured (no sys.modules lookup: our module is synthetic).
+            let module_handle = module_handle.clone_ref(py);
+            let binder = PyCFunction::new_closure(py, None, None, move |a: &Bound<'_, pyo3::types::PyTuple>, _kw: Option<&Bound<'_, pyo3::types::PyDict>>| {
+                let py = unsafe { Python::assume_gil_acquired() };
+                let f = a.get_item(0)?;
+                module_handle.bind(py).setattr(event.clone(), &f)?;
+                Ok::<_, pyo3::PyErr>(f.unbind())
             })?;
-            Ok::<_, pyo3::PyErr>(identity.into_any().unbind())
+            Ok::<_, pyo3::PyErr>(binder.into_any().unbind())
         } else {
             Ok::<_, pyo3::PyErr>(first.unbind())
         }
