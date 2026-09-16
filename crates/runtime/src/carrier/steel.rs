@@ -1,45 +1,60 @@
 //! Steel (Scheme) carrier. Zero-ambiguity S-expressions; the natural fit for
 //! AI-generated operation code.
 
-use super::{ExecRequest, ExecResult, HostBridge};
+use super::{ExecResult, HostBridge};
 use serde_json::Value;
 use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 
-pub fn execute(req: ExecRequest) -> ExecResult {
-    let mut engine = Engine::new();
-    register_host(&mut engine, req.host);
-    register_on_collector(&mut engine);
-    engine.run(req.source.to_owned()).map_err(|e| anyhow::anyhow!("steel run: {e:?}"))?;
-    // Bind each collected handler under its EVENT NAME (register_value —
-    // dotted names are fine: env lookup is by string, not by parser ident).
-    // Event delivery addresses handlers by event name.
-    bind_event_handlers(&mut engine);
+/// Resident steel session: one VM per actor instance. The source runs ONCE
+/// at load (with the `on` collector bound and handlers bound under event
+/// names); every later call addresses a handler by name in the SAME VM —
+/// definitions, `define`s and other top-level state persist across calls.
+/// Drop = VM gone.
+pub struct SteelSession {
+    engine: Engine,
+}
 
-    if let Some(entry) = req.entry {
-        // Args arrive as a NATIVE steel value (hash/list) — no re-parsing
-        // inside the script; the carrier marshals at the boundary.
-        let args_val = json_to_steel(req.args).map_err(|e| anyhow::anyhow!("steel args marshal: {e}"))?;
-        // Interim shim (until the event→fn-name mapping lands in the
-        // router): an addressed name with no matching function falls back
-        // to the script's conventional `execute` entry.
-        let called = if engine.extract_value(entry).is_ok() {
-            entry.to_string()
-        } else if engine.extract_value("execute").is_ok() {
+unsafe impl Send for SteelSession {}
+
+impl SteelSession {
+    pub fn new(host: Option<&HostBridge>) -> Self {
+        let mut engine = Engine::new();
+        register_host(&mut engine, host);
+        register_on_collector(&mut engine);
+        Self { engine }
+    }
+}
+
+impl super::session::ResidentSession for SteelSession {
+    fn load(&mut self, source: &str) -> anyhow::Result<()> {
+        self.engine
+            .run(source.to_owned())
+            .map_err(|e| anyhow::anyhow!("steel load: {e:?}"))?;
+        bind_event_handlers(&mut self.engine);
+        Ok(())
+    }
+
+    fn call(&mut self, handler: &str, args: &Value) -> anyhow::Result<Value> {
+        // Interim shim (as in the retired one-shot path): event delivery
+        // still addresses handlers by EVENT name; a script that only
+        // defines the conventional `execute` still receives events until
+        // queues record real handler names.
+        let name = if self.engine.extract_value(handler).is_ok() {
+            handler.to_string()
+        } else if self.engine.extract_value("execute").is_ok() {
             "execute".to_string()
         } else {
-            entry.to_string()
+            handler.to_string()
         };
-        let val = engine
-            .call_function_by_name_with_args(&called, vec![args_val])
-            .map_err(|e| anyhow::anyhow!("steel call {called}: {e:?}"))?;
-        return steel_to_json(&val);
-    }
-    // No entry point: the source registers its result in `*result*`.
-    match engine.extract_value("*result*") {
-        Ok(val) => steel_to_json(&val),
-        Err(_) => Ok(Value::Null),
+        let args_val = json_to_steel(args)
+            .map_err(|e| anyhow::anyhow!("steel args marshal: {e}"))?;
+        let val = self
+            .engine
+            .call_function_by_name_with_args(&name, vec![args_val])
+            .map_err(|e| anyhow::anyhow!("steel call {name}: {e:?}"))?;
+        steel_to_json(&val)
     }
 }
 

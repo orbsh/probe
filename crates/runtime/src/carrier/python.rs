@@ -1,6 +1,6 @@
 //! Python carrier (PyO3, in-process CPython, zero IPC).
 
-use super::{ExecRequest, ExecResult, HostFn};
+use super::{ExecResult, HostBridge, HostFn};
 use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
@@ -105,63 +105,77 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
     Ok((module, registry))
 }
 
-pub fn execute(req: ExecRequest) -> ExecResult {
-    Python::with_gil(|py| -> ExecResult {
-        let (module, _registry) = load_module(py, req.source)
-            .map_err(|e| anyhow::anyhow!("python load: {e}"))?;
+/// Resident python session: module loaded once, handlers called by name
+/// across calls. The module's global dict IS the session state — variables
+/// set by one handler are visible to the next. Drop = state gone. Host
+/// functions are bound at load and stay bound.
+pub struct PythonSession {
+    module: Option<Py<PyModule>>,
+    host: Option<HostBridge>,
+}
 
-        // Expose each host function as a module-level callable taking one
-        // JSON string and returning the parsed JSON value. PyCFunction over
-        // a Rust closure keeps the marshal at the boundary — no code-gen.
-        if let Some(bridge) = req.host {
-            for (name, f) in &bridge.functions {
-                let f: HostFn = f.clone();
-                let call = PyCFunction::new_closure(py, None, None, move |args, _kw| {
-                    let raw: String = args
-                        .get_item(0)?
-                        .extract()?;
-                    // We already hold the GIL (running inside a Python call);
-                    // unsafe-assert it to detach the result's lifetime from
-                    // the closure args.
-                    let py = unsafe { Python::assume_gil_acquired() };
-                    // The script passes a JSON string; decode it so the host
-                    // fn sees the structured value (marshal at boundary).
-                    let decoded: Value = serde_json::from_str(&raw)
-                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("host arg not JSON: {e}")))?;
-                    let out = (f)(decoded)
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                    Ok::<_, pyo3::PyErr>(json_to_py(py, &out)?.unbind())
-                })?;
-                module.add(name.as_str(), call)?;
+// Py<PyModule> is not Send; sessions live on one runtime thread each, so
+// the Send impl is exact (same reasoning as steel's thread-local design).
+unsafe impl Send for PythonSession {}
+
+impl PythonSession {
+    pub fn new(host: Option<&HostBridge>) -> anyhow::Result<Self> {
+        Ok(Self { module: None, host: host.cloned() })
+    }
+}
+
+impl super::session::ResidentSession for PythonSession {
+    fn load(&mut self, source: &str) -> anyhow::Result<()> {
+        Python::with_gil(|py| -> anyhow::Result<()> {
+            let (module, _registry) = load_module(py, source)
+                .map_err(|e| anyhow::anyhow!("python load: {e}"))?;
+            // Host functions bind once at load and stay for the session's
+            // whole life — same marshal contract as the old one-shot path.
+            if let Some(bridge) = &self.host {
+                for (name, f) in &bridge.functions {
+                    let f: HostFn = f.clone();
+                    let call = PyCFunction::new_closure(py, None, None, move |args, _kw| {
+                        let py = unsafe { Python::assume_gil_acquired() };
+                        let raw: String = args.get_item(0)?.extract()?;
+                        let decoded: Value = serde_json::from_str(&raw)
+                            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("host arg not JSON: {e}")))?;
+                        let out = (f)(decoded)
+                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                        Ok::<_, pyo3::PyErr>(json_to_py(py, &out)?.unbind())
+                    })?;
+                    module.add(name.as_str(), call)?;
+                }
             }
-        }
+            self.module = Some(module.unbind());
+            Ok(())
+        })
+    }
 
-        let args_py = json_to_py(py, req.args)?;
-
-        let result = match req.entry {
-            Some(entry) => {
-                // Interim shim (until event→fn-name mapping lands in the
-                // router): an addressed name with no matching function
-                // falls back to the script's conventional `execute` entry.
-                let name = match module.getattr(entry) {
-                    Ok(_) => entry.to_string(),
-                    // Fall back only when `execute` exists; otherwise the
-                    // missing entry stays an error.
-                    Err(_) if module.getattr("execute").is_ok() => "execute".to_string(),
-                    Err(e) => return Err(anyhow::anyhow!("python entry {entry}: {e}")),
-                };
-                let func = module.getattr(&name).map_err(|e| anyhow::anyhow!("python entry {name}: {e}"))?;
-                func.call1((args_py,)).map_err(|e| anyhow::anyhow!("python call {name}: {e}"))?
-            }
-            // No entry point: the script sets a module-level `result`
-            // variable during import-time execution.
-            None => module
-                .getattr("result")
-                .map_err(|e| anyhow::anyhow!("python: no entry and no `result` binding: {e}"))?,
-        };
-
-        json_from_py(py, &result)
-    })
+    fn call(&mut self, handler: &str, args: &Value) -> anyhow::Result<Value> {
+        Python::with_gil(|py| -> anyhow::Result<Value> {
+            let module = self.module.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("python session: call before load"))?
+                .bind(py);
+            // Interim shim: fall back to the conventional `execute` entry
+            // when the addressed name has no binding (event delivery
+            // addressing parity with the retired one-shot path).
+            let name = if module.getattr(handler).is_ok() {
+                handler.to_string()
+            } else if module.getattr("execute").is_ok() {
+                "execute".to_string()
+            } else {
+                handler.to_string()
+            };
+            let func = module
+                .getattr(&name)
+                .map_err(|e| anyhow::anyhow!("python handler {name}: {e}"))?;
+            let args_py = json_to_py(py, args)?;
+            let result = func
+                .call1((args_py,))
+                .map_err(|e| anyhow::anyhow!("python call {name}: {e}"))?;
+            json_from_py(py, &result)
+        })
+    }
 }
 
 /// Upload-time introspection: load the module once (load discarded after),

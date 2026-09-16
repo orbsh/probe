@@ -46,19 +46,20 @@ pub mod wasmtime;
 pub mod nushell;
 #[cfg(feature = "nushell")]
 pub mod nushell_session;
+pub mod session;
 
 /// Dispatch by declared language. Unknown language = error value, never a
 /// panic: the control plane declared it, the Probe only validates.
 pub fn execute(language: &str, req: ExecRequest) -> anyhow::Result<Value> {
     match language {
         #[cfg(feature = "steel")]
-        "steel" => steel::execute(req),
+        "steel" => anyhow::bail!("steel is resident-only: use carrier::session"),
         #[cfg(feature = "python")]
-        "python" => python::execute(req),
+        "python" => anyhow::bail!("python is resident-only: use carrier::session"),
         #[cfg(feature = "wasmtime")]
         "wasmtime" => wasmtime::execute(req),
         #[cfg(feature = "nushell")]
-        "nushell" => nushell::execute(req),
+        "nushell" => anyhow::bail!("nushell is resident-only: use carrier::session (no one-shot execution)"),
         other => anyhow::bail!("language not carried by this probe build: {other}"),
     }
 }
@@ -73,16 +74,15 @@ pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
         #[cfg(feature = "python")]
         "python" => python::introspect(source),
         // Languages without collectors: the script hand-writes the whole
-        // `interface_schema` — the generic entry call covers them.
-        _ => execute(
-            language,
-            ExecRequest {
-                source,
-                entry: Some("interface_schema"),
-                args: &Value::Null,
-                host: None,
-            },
-        ),
+        // `interface_schema` — run it in a THROWAWAY resident session
+        // (load, call the schema function, drop). Same contract, no
+        // one-shot execution path.
+        _ => {
+            let sessions = session::Sessions::new();
+            sessions.with_session("__introspect", language, source, None, |s| {
+                s.call("interface_schema", &Value::Null)
+            })
+        }
     }
 }
 

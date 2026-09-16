@@ -1,73 +1,68 @@
 //! Carrier contract, as executable documentation.
 //!
-//! Every carrier — in-process or subprocess — honors the same contract:
-//! JSON args in, JSON result out, entry function declared by the operation,
-//! failures as error values (never panics). These tests double as the
-//! reference for how an operation looks in each carried language.
+//! Every carrier honors the same contract: JSON args in, JSON result out,
+//! handlers addressed by name, failures as error values (never panics).
+//! Execution is RESIDENT — one session per actor instance, loaded once,
+//! called per event. These tests double as the reference for how an actor
+//! looks in each carried language.
 
-use probe_runtime::carrier::{execute, ExecRequest};
+use probe_runtime::carrier::session::Sessions;
+use probe_runtime::carrier::{execute, HostBridge};
+
+fn run(language: &str, src: &str, handler: &str, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let sessions = Sessions::new();
+    sessions.with_session("t1", language, src, None::<&HostBridge>, |s| {
+        s.call(handler, args)
+    })
+}
 
 // ---------------------------------------------------------------- python --
-// Operation shape: a module with an exported entry function taking the
-// parsed args (dict/list/...) and returning a JSON-serializable value.
+// Actor shape: handlers defined and bound (via @on or plain def) at load;
+// each event call invokes the handler by name with parsed args.
 #[cfg(feature = "python")]
 #[test]
 fn py_entry_with_args() {
-    let args = serde_json::json!({ "x": 21 });
-    let src = "def execute(args):\n    return {\"doubled\": args[\"x\"] * 2}\n";
-    let out = execute(
-        "python",
-        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
-    )
-    .unwrap();
+    let src = "def doubled(args):\n    return {\"doubled\": args[\"x\"] * 2}\n";
+    let out = run("python", src, "doubled", &serde_json::json!({ "x": 21 })).unwrap();
     assert_eq!(out, serde_json::json!({"doubled": 42}));
 }
 
-// No entry declared: the script sets a module-level `result` variable.
+// Module-level state persists across calls in the same session.
 #[cfg(feature = "python")]
 #[test]
-fn py_result_binding() {
-    let args = serde_json::json!(null);
-    let src = "result = [1, 2, 3]\n";
-    let out = execute(
-        "python",
-        ExecRequest { source: src, entry: None, args: &args, host: None },
-    )
-    .unwrap();
-    assert_eq!(out, serde_json::json!([1, 2, 3]));
+fn py_state_persists() {
+    let src = "acc = []\ndef push(args):\n    acc.append(args[\"item\"])\n    return acc\n";
+    let sessions = Sessions::new();
+    let host: Option<&HostBridge> = None;
+    let call = |s: &mut dyn probe_runtime::carrier::session::ResidentSession| {
+        s.call("push", &serde_json::json!({"item": "book"}))
+    };
+    sessions.with_session("i", "python", src, host, call).unwrap();
+    let out = sessions.with_session("i", "python", src, host, call).unwrap();
+    assert_eq!(out, serde_json::json!(["book", "book"]));
 }
 
-// A missing entry is an error value, never a panic.
+// A missing handler is an error value, never a panic.
 #[cfg(feature = "python")]
 #[test]
 fn py_missing_entry_is_error_value() {
-    let args = serde_json::json!(null);
-    let err = execute(
-        "python",
-        ExecRequest { source: "x = 1\n", entry: Some("nope"), args: &args, host: None },
-    )
-    .unwrap_err();
+    let err = run("python", "x = 1\n", "nope", &serde_json::json!(null)).unwrap_err();
     assert!(err.to_string().contains("nope"));
 }
 
 // --------------------------------------------------------------- nushell --
-// Operation shape: a module exporting a named function. Args arrive as one
-// parsed value (record/list/...); the return value is structured and
-// serialized by the wrapper.
+// Actor shape: a module exporting named functions (`def --env` for handlers
+// that write $env state). Args arrive as one parsed value; results are
+// structured and travel via files (the PTY stream is discarded).
 #[cfg(feature = "nushell")]
 #[test]
 fn nu_entry_with_args() {
-    let args = serde_json::json!({ "x": 21 });
     let src = r#"
-export def execute [args] {
+export def double [args] {
     { doubled: ($args.x * 2) }
 }
 "#;
-    let out = execute(
-        "nushell",
-        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
-    )
-    .unwrap();
+    let out = run("nushell", src, "double", &serde_json::json!({ "x": 21 })).unwrap();
     assert_eq!(out, serde_json::json!({"doubled": 42}));
 }
 
@@ -75,81 +70,55 @@ export def execute [args] {
 #[cfg(feature = "nushell")]
 #[test]
 fn nu_pipeline_result() {
-    let args = serde_json::json!({ "items": [3, 1, 2] });
     let src = r#"
-export def execute [args] {
+export def sort_items [args] {
     $args.items | sort
 }
 "#;
-    let out = execute(
-        "nushell",
-        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
-    )
-    .unwrap();
+    let out = run("nushell", src, "sort_items", &serde_json::json!({ "items": [3, 1, 2] })).unwrap();
     assert_eq!(out, serde_json::json!([1, 2, 3]));
 }
 
-// nu module import cannot address a bare `main`; operations must export a
-// named function. Declaring `main` is rejected up front.
-#[cfg(feature = "nushell")]
-#[test]
-fn nu_rejects_main_entry() {
-    let args = serde_json::json!(null);
-    let err = execute(
-        "nushell",
-        ExecRequest { source: "export def main [] {}", entry: Some("main"), args: &args, host: None },
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("named function"));
-}
-
 // ----------------------------------------------------------------- steel --
-// Operation shape: definitions plus an entry function; args arrive as a
-// JSON string (the operation parses what it needs).
+// Actor shape: definitions plus handler lambdas; args arrive as a native
+// steel value (the carrier marshals at the boundary).
 #[cfg(feature = "steel")]
 #[test]
 fn steel_entry_with_args() {
-    let args = serde_json::json!({ "x": 2 });
     let src = r#"
-(define (execute args)
-  (string-append "x=" (number->string 2)))
+(define (greet args)
+  (string-append "x=" (number->string (hash-ref args "x"))))
 "#;
-    let out = execute(
-        "steel",
-        ExecRequest { source: src, entry: Some("execute"), args: &args, host: None },
-    )
-    .unwrap();
+    let out = run("steel", src, "greet", &serde_json::json!({ "x": 2 })).unwrap();
     assert_eq!(out, serde_json::json!("x=2"));
 }
 
-// No entry: the source registers its result in `*result*`.
-#[cfg(feature = "steel")]
-#[test]
-fn steel_result_binding() {
-    let args = serde_json::json!(null);
-    let out = execute(
-        "steel",
-        ExecRequest {
-            source: "(define *result* (* 6 7))",
-            entry: None,
-            args: &args,
-            host: None,
-        },
-    )
-    .unwrap();
-    assert_eq!(out, serde_json::json!(42));
-}
-
 // A language the node does not carry is an error value: the control plane
-// declares, the Probe only validates.
+// declares, the Probe only validates. (Surfaces at session spawn.)
 #[cfg(feature = "steel")]
 #[test]
 fn unknown_language_is_error_value() {
-    let args = serde_json::json!(null);
+    let sessions = Sessions::new();
+    let err = sessions
+        .with_session("t1", "koto", "(+ 1 2)", None::<&HostBridge>, |s| {
+            s.call("f", &serde_json::json!(null))
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("koto"));
+}
+
+// The retired one-shot execute() refuses resident languages explicitly.
+#[test]
+fn one_shot_execute_is_gone() {
     let err = execute(
-        "koto",
-        ExecRequest { source: "(+ 1 2)", entry: None, args: &args, host: None },
+        "steel",
+        probe_runtime::carrier::ExecRequest {
+            source: "",
+            entry: None,
+            args: &serde_json::json!(null),
+            host: None,
+        },
     )
     .unwrap_err();
-    assert!(err.to_string().contains("koto"));
+    assert!(err.to_string().contains("resident-only"));
 }

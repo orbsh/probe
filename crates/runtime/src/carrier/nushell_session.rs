@@ -49,9 +49,10 @@ impl NushellSession {
     }
 
     /// Load the actor module (defines the handler functions).
-    pub fn load(&mut self, script_path: &str) {
+    pub fn load(&mut self, script_path: &str) -> Result<()> {
         self.send(&format!("source '{}'\r\n", script_path));
         self.pump(1.5);
+        Ok(())
     }
 
     /// Invoke one handler with parsed JSON args; returns the JSON result.
