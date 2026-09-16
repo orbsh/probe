@@ -68,3 +68,23 @@ pub enum CodePayload {
         expected_sha256: String,
     },
 }
+
+
+/// Transport envelope over the outbound connection (Phase 3). The control
+/// plane sends exactly one frame per WS message; the probe replies likewise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Frame {
+    /// Probe to control plane, once per connection.
+    Register {
+        node_alias: String,
+        credential: String,
+        carriers: Vec<String>,
+    },
+    /// Control plane to probe: a `Register` was accepted.
+    Registered,
+    /// Control plane to probe: one operation.
+    Call(ToolCall),
+    /// Probe to control plane: the operation's answer.
+    Result(ToolResult),
+}

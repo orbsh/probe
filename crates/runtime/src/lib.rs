@@ -5,3 +5,6 @@
 //! `tests/carriers.rs`.
 
 pub mod carrier;
+
+/// Remote wrapper (Phase 3): outbound WS, registration, task loop.
+pub mod remote;
