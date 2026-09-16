@@ -44,6 +44,8 @@ pub mod python;
 pub mod wasmtime;
 #[cfg(feature = "nushell")]
 pub mod nushell;
+#[cfg(feature = "nushell")]
+pub mod nushell_session;
 
 /// Dispatch by declared language. Unknown language = error value, never a
 /// panic: the control plane declared it, the Probe only validates.
