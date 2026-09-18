@@ -87,4 +87,51 @@ pub enum Frame {
     Call(ToolCall),
     /// Probe to control plane: the operation's answer.
     Result(ToolResult),
+    /// Bidirectional: a host-function round trip (ctx bridge over the
+    /// wire). Probe -> control plane = Call, control plane -> probe =
+    /// Result; the `host_call_id` correlates. The control plane resolves
+    /// the call against the ACTOR INSTANCE that the enclosing ToolCall was
+    /// routed to (the gateway tracks call_id -> instance; ctx state is
+    /// scoped to that instance's own fields).
+    Host(HostFrame),
+}
+
+/// One host-function round trip (ctx over the wire).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostFrame {
+    Call(HostCall),
+    Result(HostResult),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostCall {
+    pub host_call_id: String,
+    /// The enclosing ToolCall's id — the control plane resolves the ctx
+    /// scope (actor instance) from it.
+    pub call_id: String,
+    pub op: HostOp,
+}
+
+/// The ctx surface scripts can reach, carried op-by-op. `state_*` touches
+/// the instance's own fields (cross-instance reach is not expressible);
+/// `invoke` rides the control plane's unified call model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum HostOp {
+    StateGet { field: String },
+    StateSet { field: String, value: serde_json::Value },
+    StateDelete { field: String },
+    Invoke {
+        target_type: String,
+        target_key: String,
+        handler: String,
+        args: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostResult {
+    pub host_call_id: String,
+    pub outcome: Result<serde_json::Value, String>,
 }

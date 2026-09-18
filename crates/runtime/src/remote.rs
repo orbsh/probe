@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use probe_config::ProbeConfig;
-use probe_protocol::{CodePayload, Frame, ToolCall, ToolResult};
+use probe_protocol::{CodePayload, Frame, HostCall, HostFrame, HostOp, ToolCall, ToolResult};
 use crate::carrier::session::Sessions;
 use crate::carrier::HostBridge;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ async fn serve_connection(
     config: &ProbeConfig,
     sessions: &Sessions,
 ) -> Result<()> {
+    let pending_host: Arc<PendingHost> = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let (ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .with_context(|| format!("dial control plane {ws_url}"))?;
@@ -45,26 +46,57 @@ async fn serve_connection(
         _ => anyhow::bail!("control plane closed before registration"),
     }
 
-    // Task loop: calls arrive pushed down the connection. Same-node
-    // seriality comes free from the per-instance slot locks in `Sessions`;
-    // concurrent calls on distinct instances are not parallelized here (one
-    // in-flight call per connection — the control plane opens more
-    // connections for concurrency).
+    // Bidirectional loop: a writer task drains an mpsc into the sink; the
+    // reader dispatches incoming frames. Host calls (ctx bridge) flow
+    // probe->control-plane while a ToolCall is executing — the two task
+    // structure makes the connection full-duplex at the frame level.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if sink.send(Message::Text(serde_json::to_string(&frame)?)).await.is_err() {
+                break;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
     while let Some(msg) = stream.next().await {
         let Message::Text(text) = msg? else { continue };
         let frame: Frame = serde_json::from_str(&text)?;
-        let Frame::Call(call) = frame else {
-            anyhow::bail!("unexpected frame from control plane: {frame:?}");
-        };
-        let result = execute_call(config, sessions, &call).await;
-        let reply = Frame::Result(ToolResult {
-            call_id: call.call_id.clone(),
-            outcome: result,
-        });
-        sink.send(Message::Text(serde_json::to_string(&reply)?)).await?;
+        match frame {
+            Frame::Call(call) => {
+                let tx = tx.clone();
+                let pending_host = pending_host.clone();
+                let config = config.clone();
+                let sessions = sessions.clone();
+                // One session task per call; host calls it makes run
+                // concurrently over the same writer channel.
+                tokio::spawn(async move {
+                    let result = execute_call(&config, &sessions, &call, &tx, &pending_host).await;
+                    let _ = tx.send(Frame::Result(ToolResult {
+                        call_id: call.call_id.clone(),
+                        outcome: result,
+                    }));
+                });
+            }
+            Frame::Host(HostFrame::Result(hr)) => {
+                let mut pending = pending_host.lock().unwrap();
+                if let Some(tx) = pending.remove(&hr.host_call_id) {
+                    let _ = tx.send(hr.outcome);
+                }
+                // Unknown id: the caller timed out — drop the late result.
+            }
+            other => anyhow::bail!("unexpected frame from control plane: {other:?}"),
+        }
     }
+    writer.abort();
     Ok(())
 }
+
+/// Pending host calls: host_call_id -> reply path.
+type PendingHost = std::sync::Mutex<
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
+>;
 
 /// Execute one ToolCall against the resident sessions. Phase 4 adds the
 /// `link` payload form; today only inline bytes are consumed (a `link`
@@ -74,8 +106,10 @@ async fn execute_call(
     config: &ProbeConfig,
     sessions: &Sessions,
     call: &ToolCall,
+    tx: &tokio::sync::mpsc::UnboundedSender<Frame>,
+    pending_host: &Arc<PendingHost>,
 ) -> Result<serde_json::Value, String> {
-    execute_call_inner(config, sessions, call)
+    execute_call_inner(config, sessions, call, tx, pending_host)
         .await
         .map_err(|e| e.to_string())
 }
@@ -84,6 +118,8 @@ async fn execute_call_inner(
     config: &ProbeConfig,
     sessions: &Sessions,
     call: &ToolCall,
+    tx: &tokio::sync::mpsc::UnboundedSender<Frame>,
+    pending_host: &Arc<PendingHost>,
 ) -> Result<serde_json::Value> {
     let CodePayload::Inline { bytes } = &call.code else {
         anyhow::bail!(
@@ -96,10 +132,10 @@ async fn execute_call_inner(
     // Session key: one resident VM per (node, tool). Args carry no
     // partition here — the control plane's actor model owns partitioning
     // and addresses this node as one actor per tool.
+    // Host bridge: ctx ops ride Frame::Host over the same connection, each
+    // with a unique host_call_id; the closure awaits the correlated reply.
+    let bridge = build_host_bridge(call.call_id.clone(), &tx, pending_host);
     let key = format!("probe/{}/{}", config.capabilities.node_alias, call.tool);
-    // with_session is sync (CPU-bound VM work); keep it off the async
-    // reactor with spawn_blocking. Nushell's PTY pump yields in poll(),
-    // so it never starves the thread.
     let sessions = sessions.clone();
     let language = call.language.clone();
     let handler = call.tool.clone();
@@ -110,13 +146,117 @@ async fn execute_call_inner(
             &format!("probe/{node_alias}/{handler}"),
             &language,
             &source,
-            None::<&HostBridge>,
+            Some(&bridge),
             |s| s.call(&handler, &args),
         )
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("session task join: {e}")))
 }
+
+/// Build a HostBridge whose functions send Frame::Host(Call) over the
+/// connection and await the correlated Frame::Host(Result). One JSON arg
+/// in, JSON value out — the same marshal contract as in-process bridges.
+fn build_host_bridge(
+    call_id: String,
+    tx: &tokio::sync::mpsc::UnboundedSender<Frame>,
+    pending_host: &Arc<PendingHost>,
+) -> HostBridge {
+    let tx = tx.clone();
+    let pending = pending_host.clone();
+    let mut bridge = HostBridge::default();
+    for name in ["ctx_state_get", "ctx_state_set", "ctx_state_delete", "ctx_invoke"] {
+        let tx = tx.clone();
+        let pending = pending.clone();
+        let call_id = call_id.clone();
+        let f: crate::carrier::HostFn = Arc::new(move |arg: serde_json::Value| {
+            let (op_tx, op_rx) = tokio::sync::oneshot::channel();
+            let host_call_id = format!("host-{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+            let op = match name {
+                "ctx_state_get" => {
+                    // Steel passes a JSON string arg; python passes the
+                    // decoded value. Normalize: field name from string or
+                    // object {"field": ...}.
+                    let field = match &arg {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Object(m) => m
+                            .get("field")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        _ => arg.to_string(),
+                    };
+                    HostOp::StateGet { field }
+                }
+                "ctx_state_set" => {
+                    let m = match &arg {
+                        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                            .unwrap_or(serde_json::Value::Null),
+                        other => other.clone(),
+                    };
+                    let field = m
+                        .get("field")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let value = m.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                    HostOp::StateSet { field, value }
+                }
+                "ctx_state_delete" => {
+                    let field = match &arg {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Object(m) => m
+                            .get("field")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        _ => arg.to_string(),
+                    };
+                    HostOp::StateDelete { field }
+                }
+                "ctx_invoke" => {
+                    let m = match &arg {
+                        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                            .unwrap_or(serde_json::Value::Null),
+                        other => other.clone(),
+                    };
+                    let gs = |k: &str| m.get(k).cloned().unwrap_or(serde_json::Value::Null);
+                    let gs_s = |k: &str| gs(k).as_str().unwrap_or_default().to_string();
+                    HostOp::Invoke {
+                        target_type: gs_s("type"),
+                        target_key: gs_s("key"),
+                        handler: gs_s("handler"),
+                        args: gs("args"),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            pending
+                .lock()
+                .unwrap()
+                .insert(host_call_id.clone(), op_tx);
+            tx.send(Frame::Host(HostFrame::Call(HostCall {
+                host_call_id: host_call_id.clone(),
+                call_id: call_id.clone(),
+                op,
+            })))
+            .map_err(|_| anyhow::anyhow!("connection closed"))?;
+            // Block on the reply — host fns are synchronous from the
+            // script's perspective; spawn_blocking isolation makes the
+            // await of the oneshot's blocking recv safe.
+            match op_rx.blocking_recv() {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
+                Err(_) => Err(anyhow::anyhow!("host call dropped")),
+            }
+        });
+        bridge.functions.insert(name.to_string(), f);
+    }
+    bridge
+}
+
+
 
 /// Top-level loop: dial, register, serve; reconnect with backoff on drop.
 pub async fn run(config: ProbeConfig) -> Result<()> {
