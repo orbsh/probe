@@ -79,7 +79,7 @@ pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
         // one-shot execution path.
         _ => {
             let sessions = session::Sessions::new();
-            sessions.with_session("__introspect", language, source, None, |s| {
+            sessions.with_session("__introspect", language, source, None, &crate::sandbox::SandboxPolicy::None, |s: &mut dyn crate::carrier::session::ResidentSession| {
                 s.call("interface_schema", &Value::Null)
             })
         }

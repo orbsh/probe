@@ -15,7 +15,10 @@ pub struct NushellSession {
 
 impl NushellSession {
     /// Spawn `nu --no-config-file` in a PTY and wait for the first prompt.
-    pub fn spawn() -> anyhow::Result<Self> {
+    /// A Bubblewrap policy wraps the child process: the forked child execs
+    /// `bash -c <bwrap …>` so the whole REPL lives inside the sandbox
+    /// (mount namespace set up before nu starts; no per-syscall cost).
+    pub fn spawn(policy: &crate::sandbox::SandboxPolicy) -> anyhow::Result<Self> {
         let mut master: libc::c_int = 0;
         let mut slave: libc::c_int = 0;
         if unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) } != 0 {
@@ -38,7 +41,37 @@ impl NushellSession {
                 libc::dup2(slave, 2);
                 if slave > 2 { libc::close(slave); }
                 libc::close(master);
-                libc::execlp(b"nu\0".as_ptr() as *const libc::c_char, b"nu\0".as_ptr() as *const libc::c_char, b"--no-config-file\0".as_ptr() as *const libc::c_char, std::ptr::null::<libc::c_char>());
+                match policy {
+                    crate::sandbox::SandboxPolicy::None => {
+                        libc::execlp(b"nu\0".as_ptr() as *const libc::c_char, b"nu\0".as_ptr() as *const libc::c_char, b"--no-config-file\0".as_ptr() as *const libc::c_char, std::ptr::null::<libc::c_char>());
+                    }
+                    crate::sandbox::SandboxPolicy::Bubblewrap { allow_write, deny_read, cwd, .. } => {
+                        // bwrap mount policy from the sandbox config: fs
+                        // allow/deny lists map to bind mounts, network is
+                        // unshared (--unshare-net). Domain allowlists (proxy
+                        // filtering) are a Phase 5 refinement.
+                        let config = sandbox_runtime::config::SandboxRuntimeConfig {
+                            filesystem: sandbox_runtime::config::FilesystemConfig {
+                                allow_write: allow_write.clone(),
+                                deny_read: deny_read.clone(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        let (wrapped, _) = sandbox_runtime::sandbox::linux::generate_bwrap_command(
+                            "nu --no-config-file",
+                            &config,
+                            std::path::Path::new(cwd),
+                            None,
+                            None,
+                            0,
+                            0,
+                            Some("/bin/bash"),
+                        ).expect("bwrap command");
+                        let c0 = std::ffi::CString::new(wrapped).unwrap();
+                        libc::execlp(b"bash\0".as_ptr() as *const libc::c_char, b"bash\0".as_ptr() as *const libc::c_char, b"-c\0".as_ptr() as *const libc::c_char, c0.as_ptr(), std::ptr::null::<libc::c_char>());
+                    }
+                }
                 libc::_exit(127);
             }
         }

@@ -17,7 +17,7 @@ export def --env remove_from_cart [args] {
     let op = dir.join("operation.nu");
     std::fs::write(&op, src).unwrap();
 
-    let mut session = NushellSession::spawn().unwrap();
+    let mut session = NushellSession::spawn(&probe_runtime::sandbox::SandboxPolicy::None).unwrap();
     session.load(op.to_str().unwrap());
 
     let args = serde_json::json!({ "item": "book" });

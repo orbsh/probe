@@ -65,11 +65,20 @@ pub enum NetworkPolicy {
 }
 
 /// Probe startup configuration (Phase 3): where to register and what to claim.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeConfig {
     /// Control plane endpoint for the outbound registration connection
     /// WS only — no degraded fallback (long-polling explicitly rejected).
     pub control_plane_url: String,
+    /// Wrap session processes in bubblewrap. Remote deployments MUST set
+    /// true (unattended external code); requires bwrap on PATH. In-process
+    /// embedded deployments (aura) pass None instead.
+    #[serde(default = "default_true")]
+    pub sandbox: bool,
     /// User credential used as the registration credential. Provided by the
     /// environment (single source of truth outside config files).
     pub credential_env: String,

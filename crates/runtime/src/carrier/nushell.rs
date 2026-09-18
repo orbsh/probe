@@ -21,11 +21,29 @@ pub struct NushellResident {
 }
 
 impl NushellResident {
-    pub fn new() -> Result<Self> {
-        let session = NushellSession::spawn()?;
-        let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("probe-nu-res-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(&dir)?;
+    pub fn new(policy: &crate::sandbox::SandboxPolicy) -> Result<Self> {
+        // With a Bubblewrap policy the session dir MUST live inside the
+        // sandbox's writable view: /tmp is tmpfs-mounted (files written
+        // outside vanish), so the per-session dir goes under the policy's
+        // cwd (bind-mounted by the wrapper). Unwrapped = temp dir.
+        let (session, dir) = match policy {
+            crate::sandbox::SandboxPolicy::None => {
+                let session = NushellSession::spawn(policy)?;
+                let id = SEQ.fetch_add(1, Ordering::Relaxed);
+                let dir = std::env::temp_dir()
+                    .join(format!("probe-nu-res-{}-{}", std::process::id(), id));
+                std::fs::create_dir_all(&dir)?;
+                (session, dir)
+            }
+            crate::sandbox::SandboxPolicy::Bubblewrap { cwd, .. } => {
+                let id = SEQ.fetch_add(1, Ordering::Relaxed);
+                let dir = std::path::PathBuf::from(cwd)
+                    .join(format!("probe-nu-res-{}-{}", std::process::id(), id));
+                std::fs::create_dir_all(&dir)?;
+                let session = NushellSession::spawn(policy)?;
+                (session, dir)
+            }
+        };
         Ok(Self {
             session,
             module_path: dir.join("operation.nu"),

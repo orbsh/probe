@@ -50,6 +50,7 @@ impl Sessions {
         language: &str,
         source: &str,
         host: Option<&HostBridge>,
+        sandbox: &crate::sandbox::SandboxPolicy,
         f: impl FnOnce(&mut dyn ResidentSession) -> Result<Value>,
     ) -> Result<Value> {
         let slot = {
@@ -61,7 +62,7 @@ impl Sessions {
                     // holding the registry lock — spawn errors surface as
                     // errors, never panics, and the failed entry is not
                     // cached.
-                    let mut session = spawn_session(language, host)?;
+                    let mut session = spawn_session(language, host, sandbox)?;
                     session.load(source)?;
                     let slot = Arc::new(Mutex::new(session));
                     map.insert(key.to_string(), slot.clone());
@@ -83,6 +84,7 @@ impl Sessions {
 fn spawn_session(
     language: &str,
     host: Option<&HostBridge>,
+    sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<Box<dyn ResidentSession>> {
     Ok(match language {
         #[cfg(feature = "steel")]
@@ -90,7 +92,7 @@ fn spawn_session(
         #[cfg(feature = "python")]
         "python" => Box::new(super::python::PythonSession::new(host)?),
         #[cfg(feature = "nushell")]
-        "nushell" => Box::new(super::nushell::NushellResident::new()?),
+        "nushell" => Box::new(super::nushell::NushellResident::new(sandbox)?),
         other => anyhow::bail!("language not resident-carried by this probe build: {other}"),
     })
 }

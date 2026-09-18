@@ -72,6 +72,7 @@ async fn outbound_registration_and_task_downlink() {
 
     let config = ProbeConfig {
         control_plane_url: format!("ws://127.0.0.1:{port}"),
+        sandbox: false,
         credential_env: "PROBE_TEST_CREDENTIAL".into(),
         capabilities: CapabilitySurface {
             carriers: vec!["steel".into()],
@@ -190,6 +191,7 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
 
     let config = ProbeConfig {
         control_plane_url: format!("ws://127.0.0.1:{ws_port}"),
+        sandbox: false,
         credential_env: "PROBE_LINK_CREDENTIAL".into(),
         capabilities: CapabilitySurface {
             carriers: vec!["steel".into()],

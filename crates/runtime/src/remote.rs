@@ -148,13 +148,17 @@ async fn execute_call_inner(
     let handler = call.tool.clone();
     let args = call.args.clone();
     let node_alias = config.capabilities.node_alias.clone();
+    let sandbox = sandbox_policy_for(config);
     tokio::task::spawn_blocking(move || {
         sessions.with_session(
             &format!("probe/{node_alias}/{handler}"),
             &language,
             &source,
             Some(&bridge),
-            |s| s.call(&handler, &args),
+            &sandbox,
+            |s: &mut dyn crate::carrier::session::ResidentSession| {
+                s.call(&handler, &args)
+            },
         )
     })
     .await
@@ -302,5 +306,13 @@ pub async fn run(config: ProbeConfig) -> Result<()> {
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+    }
+}fn sandbox_policy_for(config: &ProbeConfig) -> crate::sandbox::SandboxPolicy {
+    use crate::sandbox::SandboxPolicy;
+    SandboxPolicy::Bubblewrap {
+        allow_write: config.capabilities.fs_scope.clone(),
+        deny_read: vec![],
+        cwd: std::env::temp_dir().display().to_string(),
+        allowed_domains: vec![],
     }
 }
