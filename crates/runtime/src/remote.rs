@@ -7,6 +7,7 @@
 //! defaults).
 
 use anyhow::{Context, Result};
+use std::io::Read as _;
 use futures_util::{SinkExt, StreamExt};
 use probe_config::ProbeConfig;
 use probe_protocol::{CodePayload, Frame, HostCall, HostFrame, HostOp, ToolCall, ToolResult};
@@ -123,13 +124,17 @@ async fn execute_call_inner(
     tx: &tokio::sync::mpsc::UnboundedSender<Frame>,
     pending_host: &Arc<PendingHost>,
 ) -> Result<serde_json::Value> {
-    let CodePayload::Inline { bytes } = &call.code else {
-        anyhow::bail!(
-            "link code payloads arrive with Phase 4 (chunked WS delivery); got Link"
-        );
+    // Two payload forms (Phase 4): inline bytes ride the frame; link
+    // payloads are fetched by content-hash URL — the URL is its own
+    // invalidation policy, the hash verifies the bytes (zero cache: the
+    // probe holds nothing between calls and initiates no fetch of its own
+    // beyond the declared one).
+    let bytes = match &call.code {
+        CodePayload::Inline { bytes } => bytes.clone(),
+        CodePayload::Link { url, expected_sha256, .. } => fetch_link(url, expected_sha256)?,
     };
-    let source = String::from_utf8(bytes.clone())
-        .context("inline code is not valid UTF-8")?;
+    let source = String::from_utf8(bytes)
+        .context("code payload is not valid UTF-8")?;
 
     // Session key: one resident VM per (node, tool). Args carry no
     // partition here — the control plane's actor model owns partitioning
@@ -259,6 +264,30 @@ fn build_host_bridge(
 }
 
 
+
+/// Fetch a Link payload: GET the URL, verify sha256 against the expected
+/// hash (hex). The content-hash URL means a mismatch is either tampering
+/// or a stale resolution — both are errors, never a silent accept.
+fn fetch_link(url: &str, expected_sha256: &str) -> anyhow::Result<Vec<u8>> {
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| anyhow::anyhow!("link fetch {url}: {e}"))?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("link read {url}: {e}"))?;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let got = hex::encode(hasher.finalize());
+    if got != expected_sha256.to_lowercase() {
+        anyhow::bail!(
+            "link hash mismatch for {url}: expected {expected_sha256}, got {got}"
+        );
+    }
+    Ok(bytes)
+}
 
 /// Top-level loop: dial, register, serve; reconnect with backoff on drop.
 pub async fn run(config: ProbeConfig) -> Result<()> {
