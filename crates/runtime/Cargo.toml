@@ -15,6 +15,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 tokio-tungstenite = "0.24"
 ureq = "2"
 sandbox-runtime = { git = "https://github.com/wangyedev/sandbox-runtime-rs" }
+okm-wire = { path = "../../../okm/okm-wire" }
+okm-core = { path = "../../../okm/okm-core", features = ["fjall"] }
 sha2 = "0.10"
 hex = "0.4"
 futures-util = "0.3"
@@ -29,3 +31,6 @@ steel = ["dep:steel-core", "dep:im-rc"]
 python = ["dep:pyo3"]
 wasmtime = ["dep:wasmtime"]
 nushell = []
+
+[dev-dependencies]
+tempfile = "3"
