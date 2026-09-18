@@ -1,8 +1,10 @@
 //! The remote wrapper (Phase 3): outbound WS to the control plane, register
 //! presence + capability, then serve pushed-down calls against the resident
 //! carrier sessions. No inbound ports — the probe always dials out; the
-//! connection carries both directions. Long-polling is the degraded form and
-//! is NOT implemented here (the WS loop is the contract).
+//! connection carries both directions. No degraded fallback exists by
+//! design: long-polling was explicitly rejected (WS-only is the contract —
+//! the control determines compromise, not the industry's conservative
+//! defaults).
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};

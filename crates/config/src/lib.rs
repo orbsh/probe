@@ -68,7 +68,7 @@ pub enum NetworkPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeConfig {
     /// Control plane endpoint for the outbound registration connection
-    /// (WS preferred; long-polling is the degraded implementation).
+    /// WS only — no degraded fallback (long-polling explicitly rejected).
     pub control_plane_url: String,
     /// User credential used as the registration credential. Provided by the
     /// environment (single source of truth outside config files).
