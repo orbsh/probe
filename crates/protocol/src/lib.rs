@@ -97,9 +97,23 @@ pub enum Frame {
     /// Bidirectional: KV op frames for a `#[kv_storage]` executor instance
     /// (ADR-0010). Control plane -> probe = request (the raw OpFrame bytes
     /// a remote VirtualStorage backend puts on the wire); probe -> control
-    /// plane = the executor's OpResponse. `executor` names the declared
-    /// instance (prefix ownership); `kv_id` correlates request/response.
+    /// plane = the executor's OpResponse, always a well-formed encoding.
+    /// `executor` names the declared instance (prefix ownership); `kv_id`
+    /// correlates request/response.
     Kv(KvFrame),
+    /// Probe to control plane: a `Kv` request that was NOT executed — no
+    /// declared instance by that `executor` name, or the frame did not
+    /// decode. Refusal is its own frame rather than an in-band value of the
+    /// op codec: "empty payload = refusal" was an overloaded convention
+    /// that only worked because every real `OpResponse` is non-empty, and
+    /// it left the reason unrepresentable on the wire. The sender is
+    /// answered either way — a dropped frame would leave it waiting on a
+    /// reply nobody sends.
+    KvRefused {
+        executor: String,
+        kv_id: String,
+        reason: String,
+    },
 }
 
 /// One KV executor round trip.

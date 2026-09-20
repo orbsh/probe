@@ -83,18 +83,29 @@ pub struct ProbeConfig {
     /// environment (single source of truth outside config files).
     pub credential_env: String,
     pub capabilities: CapabilitySurface,
-    /// Declared `#[kv_storage]` executor instances (Phase 4.5): name →
-    /// data dir. Each instance gets its own local engine and a prefix
-    /// bound at construction (structural isolation). Empty = the probe
-    /// hosts no KV executors and Frame::Kv is an error value.
+    /// Declared `#[kv_storage]` executor instances (Phase 4.5): one local
+    /// engine each, bound to a declared prefix at construction (structural
+    /// isolation). Empty = the probe hosts no KV executor and a KV frame
+    /// is refused.
     #[serde(default)]
     pub kv_executors: Vec<KvExecutorDecl>,
 }
 
-/// One declared executor instance: name addresses it on the wire; the data
-/// dir is the local engine's storage root (per-instance, never shared).
+/// One declared executor instance. This IS the operator surface ADR-0010
+/// §4 asks for: the prefix is declared here, not derived from the keys a
+/// sender happens to use, and it is not defaultable — a host without a
+/// prefix would accept any sender's bytes into the root segment, which is
+/// exactly the escape the declaration exists to make inexpressible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvExecutorDecl {
+    /// Wire address: the `executor` slot a KV frame carries.
     pub name: String,
+    /// Declared namespace prefix, same big-endian 2-byte encoding as
+    /// `#[ok_ns(N)]` / `Document::NS_PREFIX`. Remote keys enter the local
+    /// engine as `[ns hi][ns lo][sender bytes]`.
+    pub ns: u16,
+    /// Storage root of this instance's local engine. Per-instance, never
+    /// shared — two declarations pointing at one directory are two writers
+    /// on one engine, which is not a supported shape.
     pub data_dir: String,
 }

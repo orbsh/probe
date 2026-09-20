@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use std::io::Read as _;
 use futures_util::{SinkExt, StreamExt};
 use probe_config::ProbeConfig;
-use probe_protocol::{CodePayload, Frame, HostCall, HostFrame, HostOp, ToolCall, ToolResult};
+use probe_protocol::{CodePayload, Frame, HostCall, HostFrame, HostOp, KvFrame, ToolCall, ToolResult};
 use crate::carrier::session::Sessions;
 use crate::carrier::HostBridge;
+use crate::kv_executor::{KvRegistry, KvReply};
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -22,6 +23,7 @@ async fn serve_connection(
     credential: &str,
     config: &ProbeConfig,
     sessions: &Sessions,
+    registry: &Arc<KvRegistry>,
 ) -> Result<()> {
     let pending_host: Arc<PendingHost> = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let (ws, _) = tokio_tungstenite::connect_async(ws_url)
@@ -88,6 +90,45 @@ async fn serve_connection(
                     let _ = tx.send(hr.outcome);
                 }
                 // Unknown id: the caller timed out — drop the late result.
+            }
+            Frame::Kv(kv) => {
+                let tx = tx.clone();
+                let registry = Arc::clone(registry);
+                // Engine work is blocking (one frame = one WAL commit):
+                // spawn_blocking keeps the reader loop free, the same
+                // isolation the tool-call path uses. No read/write fork —
+                // every op takes this one path.
+                tokio::spawn(async move {
+                    // The dispatch closure takes ownership of the request; the
+                    // outer copies serve only the panic fallback below.
+                    let fallback = Frame::KvRefused {
+                        executor: kv.executor.clone(),
+                        kv_id: kv.kv_id.clone(),
+                        reason: "executor dispatch panicked".into(),
+                    };
+                    let reply = tokio::task::spawn_blocking(move || {
+                        // Refusal is answered, never dropped: the reason now
+                        // travels on the wire (its own frame type), so it is
+                        // not duplicated into a local log.
+                        let outcome = registry.dispatch(&kv.executor, &kv.frame);
+                        match outcome {
+                            KvReply::Response(bytes) => Frame::Kv(KvFrame {
+                                executor: kv.executor,
+                                kv_id: kv.kv_id,
+                                frame: bytes,
+                            }),
+                            KvReply::Refused(why) => Frame::KvRefused {
+                                executor: kv.executor,
+                                kv_id: kv.kv_id,
+                                reason: why.to_string(),
+                            },
+                        }
+                    })
+                    .await;
+                    // A panicked dispatch task leaves the sender waiting on a
+                    // reply nobody sends — answer the refusal it deserved.
+                    let _ = tx.send(reply.unwrap_or(fallback));
+                });
             }
             other => anyhow::bail!("unexpected frame from control plane: {other:?}"),
         }
@@ -298,9 +339,21 @@ pub async fn run(config: ProbeConfig) -> Result<()> {
     let credential = std::env::var(&config.credential_env)
         .with_context(|| format!("credential env var {} not set", config.credential_env))?;
     let sessions = Sessions::new();
+    // KV executors are opened once per process, before dialing: a
+    // declaration that cannot be served is a startup failure, not a
+    // per-frame surprise (the same fail-closed stance as the sandbox check).
+    let registry = Arc::new(KvRegistry::open(&config.kv_executors)?);
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
-        match serve_connection(&config.control_plane_url, &credential, &config, &sessions).await {
+        match serve_connection(
+            &config.control_plane_url,
+            &credential,
+            &config,
+            &sessions,
+            &registry,
+        )
+        .await
+        {
             Ok(()) => anyhow::bail!("control plane closed the connection cleanly"),
             Err(e) => eprintln!("connection lost: {e:#}; reconnecting in {:?}", backoff),
         }

@@ -80,6 +80,7 @@ async fn outbound_registration_and_task_downlink() {
             network: NetworkPolicy::None,
             ..Default::default()
         },
+        kv_executors: vec![],
     };
     std::env::set_var("PROBE_TEST_CREDENTIAL", "secret-token");
 
@@ -199,6 +200,7 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
             network: NetworkPolicy::Open,
             ..Default::default()
         },
+        kv_executors: vec![],
     };
     std::env::set_var("PROBE_LINK_CREDENTIAL", "tok");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), remote::run(config)).await;
