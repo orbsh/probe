@@ -83,4 +83,18 @@ pub struct ProbeConfig {
     /// environment (single source of truth outside config files).
     pub credential_env: String,
     pub capabilities: CapabilitySurface,
+    /// Declared `#[kv_storage]` executor instances (Phase 4.5): name →
+    /// data dir. Each instance gets its own local engine and a prefix
+    /// bound at construction (structural isolation). Empty = the probe
+    /// hosts no KV executors and Frame::Kv is an error value.
+    #[serde(default)]
+    pub kv_executors: Vec<KvExecutorDecl>,
+}
+
+/// One declared executor instance: name addresses it on the wire; the data
+/// dir is the local engine's storage root (per-instance, never shared).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvExecutorDecl {
+    pub name: String,
+    pub data_dir: String,
 }

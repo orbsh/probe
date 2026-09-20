@@ -94,6 +94,24 @@ pub enum Frame {
     /// routed to (the gateway tracks call_id -> instance; ctx state is
     /// scoped to that instance's own fields).
     Host(HostFrame),
+    /// Bidirectional: KV op frames for a `#[kv_storage]` executor instance
+    /// (ADR-0010). Control plane -> probe = request (the raw OpFrame bytes
+    /// a remote VirtualStorage backend puts on the wire); probe -> control
+    /// plane = the executor's OpResponse. `executor` names the declared
+    /// instance (prefix ownership); `kv_id` correlates request/response.
+    Kv(KvFrame),
+}
+
+/// One KV executor round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvFrame {
+    /// Which declared executor instance executes the frame.
+    pub executor: String,
+    /// Correlates the response with the request.
+    pub kv_id: String,
+    /// The raw op frame (okm-wire OpFrame::encode output) — bytes in,
+    /// bytes out; the probe parses nothing but op boundaries.
+    pub frame: Vec<u8>,
 }
 
 /// One host-function round trip (ctx over the wire).
