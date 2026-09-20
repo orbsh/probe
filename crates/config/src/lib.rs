@@ -34,9 +34,11 @@ pub struct CapabilitySurface {
     pub command_exec: bool,
     /// Network egress policy for script execution.
     pub network: NetworkPolicy,
-    /// Host alias used in target resolution (`probe:<node_alias>:<op>`),
-    /// where `<op>` resolves to a registered operation (an actor/script in
-    /// the Krystallizer graph), never a built-in.
+    /// Host alias identifying this node's connection: `register` carries it,
+    /// and the control plane keys the live connection by it. Residency and
+    /// entry addressing do NOT ride on it — those are the call's own
+    /// `session` (opaque residency identity) and `entry` (entry point in the
+    /// delivered code) fields.
     pub node_alias: String,
 }
 
@@ -83,29 +85,4 @@ pub struct ProbeConfig {
     /// environment (single source of truth outside config files).
     pub credential_env: String,
     pub capabilities: CapabilitySurface,
-    /// Declared `#[kv_storage]` executor instances (Phase 4.5): one local
-    /// engine each, bound to a declared prefix at construction (structural
-    /// isolation). Empty = the probe hosts no KV executor and a KV frame
-    /// is refused.
-    #[serde(default)]
-    pub kv_executors: Vec<KvExecutorDecl>,
-}
-
-/// One declared executor instance. This IS the operator surface ADR-0010
-/// §4 asks for: the prefix is declared here, not derived from the keys a
-/// sender happens to use, and it is not defaultable — a host without a
-/// prefix would accept any sender's bytes into the root segment, which is
-/// exactly the escape the declaration exists to make inexpressible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KvExecutorDecl {
-    /// Wire address: the `executor` slot a KV frame carries.
-    pub name: String,
-    /// Declared namespace prefix, same big-endian 2-byte encoding as
-    /// `#[ok_ns(N)]` / `Document::NS_PREFIX`. Remote keys enter the local
-    /// engine as `[ns hi][ns lo][sender bytes]`.
-    pub ns: u16,
-    /// Storage root of this instance's local engine. Per-instance, never
-    /// shared — two declarations pointing at one directory are two writers
-    /// on one engine, which is not a supported shape.
-    pub data_dir: String,
 }

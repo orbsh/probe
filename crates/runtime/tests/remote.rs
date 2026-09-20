@@ -31,10 +31,12 @@ async fn fake_control_plane(listener: TcpListener) {
     .await
     .unwrap();
 
-    // Push one call: a steel counter handler.
+    // Push one call: a steel counter handler. Session identity and entry
+    // name are separate: residency is keyed by `session` alone.
     let call = ToolCall {
         call_id: "c-1".into(),
-        tool: "counter".into(),
+        session: "counter/k1".into(),
+        entry: "counter".into(),
         language: "steel".into(),
         args: serde_json::json!({"n": 3}),
         code: CodePayload::Inline {
@@ -80,7 +82,6 @@ async fn outbound_registration_and_task_downlink() {
             network: NetworkPolicy::None,
             ..Default::default()
         },
-        kv_executors: vec![],
     };
     std::env::set_var("PROBE_TEST_CREDENTIAL", "secret-token");
 
@@ -144,7 +145,8 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
         // Link call with the CORRECT hash: fetch, verify, execute.
         let call = ToolCall {
             call_id: "c-link".into(),
-            tool: "triple".into(),
+            session: "triple/k1".into(),
+            entry: "triple".into(),
             language: "steel".into(),
             args: serde_json::json!({"n": 5}),
             code: CodePayload::Link {
@@ -168,7 +170,8 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
         // Link call with a WRONG hash: error value, never a silent accept.
         let call = ToolCall {
             call_id: "c-bad".into(),
-            tool: "triple".into(),
+            session: "triple/k1".into(),
+            entry: "triple".into(),
             language: "steel".into(),
             args: serde_json::json!({"n": 5}),
             code: CodePayload::Link {
@@ -200,7 +203,6 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
             network: NetworkPolicy::Open,
             ..Default::default()
         },
-        kv_executors: vec![],
     };
     std::env::set_var("PROBE_LINK_CREDENTIAL", "tok");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), remote::run(config)).await;

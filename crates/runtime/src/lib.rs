@@ -9,4 +9,3 @@ pub mod carrier;
 /// Remote wrapper (Phase 3): outbound WS, registration, task loop.
 pub mod remote;
 pub mod sandbox;
-pub mod kv_executor;

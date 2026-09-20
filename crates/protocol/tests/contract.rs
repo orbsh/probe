@@ -4,7 +4,8 @@ use probe_protocol::{CodePayload, ToolCall};
 fn roundtrip_inline_call() {
     let call = ToolCall {
         call_id: "c1".into(),
-        tool: "probe:home-pc:read_file".into(),
+        session: "notes/7".into(),
+        entry: "read_file".into(),
         language: "nushell".into(),
         args: serde_json::json!({ "path": "~/notes.md" }),
         code: CodePayload::Inline { bytes: b"print(1)".to_vec() },
@@ -12,6 +13,8 @@ fn roundtrip_inline_call() {
     let s = serde_json::to_string(&call).unwrap();
     let back: ToolCall = serde_json::from_str(&s).unwrap();
     assert_eq!(back.call_id, "c1");
+    assert_eq!(back.session, "notes/7", "residency identity survives the wire");
+    assert_eq!(back.entry, "read_file", "entry name survives the wire");
     assert_eq!(back.language, "nushell");
     assert!(matches!(back.code, CodePayload::Inline { .. }));
 }
