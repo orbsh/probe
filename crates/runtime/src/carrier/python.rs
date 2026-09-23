@@ -156,23 +156,17 @@ impl super::session::ResidentSession for PythonSession {
             let module = self.module.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("python session: call before load"))?
                 .bind(py);
-            // Interim shim: fall back to the conventional `execute` entry
-            // when the addressed name has no binding (event delivery
-            // addressing parity with the retired one-shot path).
-            let name = if module.getattr(handler).is_ok() {
-                handler.to_string()
-            } else if module.getattr("execute").is_ok() {
-                "execute".to_string()
-            } else {
-                handler.to_string()
-            };
+            // Handlers are addressed by their EVENT name (the @on
+            // decorator binds functions under it). No fallback: a name
+            // that does not resolve is an error, never a magic-entry
+            // redirect.
             let func = module
-                .getattr(&name)
-                .map_err(|e| anyhow::anyhow!("python handler {name}: {e}"))?;
+                .getattr(handler)
+                .map_err(|e| anyhow::anyhow!("python handler {handler}: {e}"))?;
             let args_py = json_to_py(py, args)?;
             let result = func
                 .call1((args_py,))
-                .map_err(|e| anyhow::anyhow!("python call {name}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("python call {handler}: {e}"))?;
             json_from_py(py, &result)
         })
     }

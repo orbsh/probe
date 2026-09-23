@@ -37,23 +37,15 @@ impl super::session::ResidentSession for SteelSession {
     }
 
     fn call(&mut self, handler: &str, args: &Value) -> anyhow::Result<Value> {
-        // Interim shim (as in the retired one-shot path): event delivery
-        // still addresses handlers by EVENT name; a script that only
-        // defines the conventional `execute` still receives events until
-        // queues record real handler names.
-        let name = if self.engine.extract_value(handler).is_ok() {
-            handler.to_string()
-        } else if self.engine.extract_value("execute").is_ok() {
-            "execute".to_string()
-        } else {
-            handler.to_string()
-        };
+        // Handlers are addressed by their EVENT name (the @on collector
+        // binds functions under it). No fallback: a name that does not
+        // resolve is an error, never a magic-entry redirect.
         let args_val = json_to_steel(args)
             .map_err(|e| anyhow::anyhow!("steel args marshal: {e}"))?;
         let val = self
             .engine
-            .call_function_by_name_with_args(&name, vec![args_val])
-            .map_err(|e| anyhow::anyhow!("steel call {name}: {e:?}"))?;
+            .call_function_by_name_with_args(handler, vec![args_val])
+            .map_err(|e| anyhow::anyhow!("steel call {handler}: {e:?}"))?;
         steel_to_json(&val)
     }
 }
