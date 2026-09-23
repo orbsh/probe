@@ -48,6 +48,10 @@ impl super::session::ResidentSession for SteelSession {
             .map_err(|e| anyhow::anyhow!("steel call {handler}: {e:?}"))?;
         steel_to_json(&val)
     }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 /// Expose each host function as a steel builtin taking one JSON-string arg

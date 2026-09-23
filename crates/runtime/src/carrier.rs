@@ -50,14 +50,14 @@ pub mod session;
 
 /// Dispatch by declared language. Unknown language = error value, never a
 /// panic: the control plane declared it, the Probe only validates.
-pub fn execute(language: &str, req: ExecRequest) -> anyhow::Result<Value> {
+pub fn execute(language: &str, _req: ExecRequest) -> anyhow::Result<Value> {
     match language {
         #[cfg(feature = "steel")]
         "steel" => anyhow::bail!("steel is resident-only: use carrier::session"),
         #[cfg(feature = "python")]
         "python" => anyhow::bail!("python is resident-only: use carrier::session"),
         #[cfg(feature = "wasmtime")]
-        "wasmtime" => wasmtime::execute(req),
+        "wasmtime" => anyhow::bail!("wasmtime is resident-only: use carrier::session"),
         #[cfg(feature = "nushell")]
         "nushell" => anyhow::bail!("nushell is resident-only: use carrier::session (no one-shot execution)"),
         other => anyhow::bail!("language not carried by this probe build: {other}"),
@@ -73,6 +73,27 @@ pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
         "steel" => steel::introspect(source),
         #[cfg(feature = "python")]
         "python" => python::introspect(source),
+        #[cfg(feature = "wasmtime")]
+        "wasmtime" => {
+            // Explicit `interface_schema` export wins; otherwise the
+            // receives half derives from the export list. One throwaway
+            // session, same shape as every carrier's introspection.
+            let sessions = session::Sessions::new();
+            sessions.with_session(
+                "__introspect",
+                language,
+                source,
+                None,
+                &crate::sandbox::SandboxPolicy::None,
+                |s: &mut dyn crate::carrier::session::ResidentSession| match s
+                    .as_any()
+                    .downcast_mut::<wasmtime::WasmSession>()
+                {
+                    Some(w) => w.introspect(),
+                    None => s.call(crate::carrier::wasmtime::SCHEMA, &Value::Null),
+                },
+            )
+        }
         // Languages without collectors: the script hand-writes the whole
         // `interface_schema` — run it in a THROWAWAY resident session
         // (load, call the schema function, drop). Same contract, no

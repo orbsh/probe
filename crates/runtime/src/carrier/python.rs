@@ -170,6 +170,10 @@ impl super::session::ResidentSession for PythonSession {
             json_from_py(py, &result)
         })
     }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 /// Upload-time introspection: load the module once (load discarded after),

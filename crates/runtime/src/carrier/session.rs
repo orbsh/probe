@@ -18,6 +18,9 @@ pub trait ResidentSession: Send {
     fn load(&mut self, source: &str) -> Result<()>;
     /// Invoke one handler by name with parsed JSON args.
     fn call(&mut self, handler: &str, args: &Value) -> Result<Value>;
+    /// Downcast support (carrier-specific introspection, e.g. wasm's
+    /// export-list derivation).
+    fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Per-instance slot: the session plus its own lock. The lock is held only
@@ -62,7 +65,7 @@ impl Sessions {
                     // holding the registry lock — spawn errors surface as
                     // errors, never panics, and the failed entry is not
                     // cached.
-                    let mut session = spawn_session(language, host, sandbox)?;
+                    let mut session = spawn_session(language, source, host, sandbox)?;
                     session.load(source)?;
                     let slot = Arc::new(Mutex::new(session));
                     map.insert(key.to_string(), slot.clone());
@@ -83,9 +86,14 @@ impl Sessions {
 
 fn spawn_session(
     language: &str,
+    source: &str,
     host: Option<&HostBridge>,
     sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<Box<dyn ResidentSession>> {
+    // `source` is consumed by the wasmtime arm (compile at spawn) and the
+    // `sandbox` by nushell's PTY spawn; the other arms ignore one or both.
+    #[cfg_attr(not(any(feature = "wasmtime", feature = "nushell")), allow(unused_variables))]
+    let _ = (language, source, host, sandbox);
     Ok(match language {
         #[cfg(feature = "steel")]
         "steel" => Box::new(super::steel::SteelSession::new(host)),
@@ -93,6 +101,10 @@ fn spawn_session(
         "python" => Box::new(super::python::PythonSession::new(host)?),
         #[cfg(feature = "nushell")]
         "nushell" => Box::new(super::nushell::NushellResident::new(sandbox)?),
+        // Wasm compiles AT SPAWN (from_source) — its `load` is a no-op;
+        // other carriers load lazily inside `load`. Same session shape.
+        #[cfg(feature = "wasmtime")]
+        "wasmtime" => Box::new(super::wasmtime::WasmSession::from_source(source, host)?),
         other => anyhow::bail!("language not resident-carried by this probe build: {other}"),
     })
 }

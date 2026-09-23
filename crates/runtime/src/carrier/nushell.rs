@@ -61,6 +61,10 @@ impl ResidentSession for NushellResident {
     fn call(&mut self, handler: &str, args: &Value) -> Result<Value> {
         self.session.call(handler, args)
     }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 impl Drop for NushellResident {
