@@ -158,6 +158,22 @@ fn register_on_collector(engine: &mut Engine) {
         DECLARATIONS.with(|d| d.borrow_mut().push((event, key, handler.clone())));
         Ok(handler)
     });
+    // Ctx-fn stubs for the introspection throwaway engine: scripts
+    // reference `ctx_*` host fns at load time (steel resolves free
+    // identifiers when the define is compiled), but the host bridge is
+    // not available here — introspection never CALLS a handler, the
+    // stubs only make the script load. Error values if ever invoked.
+    const CTX_STUBS: &[&str] = &[
+        "ctx_state_get", "ctx_state_set", "ctx_state_delete",
+        "ctx_invoke", "ctx_store_emit", "ctx_interface_schema",
+        "ctx_timer_register", "ctx_timer_cancel",
+    ];
+    for name in CTX_STUBS {
+        let name: &'static str = Box::leak((*name).to_string().into_boxed_str());
+        engine.register_fn(name, move |_arg: SteelVal| -> Result<SteelVal, String> {
+            Err("ctx function called during introspection (no host bridge)".to_string())
+        });
+    }
 }
 
 /// Bind collected handlers under their event names (register_value —
