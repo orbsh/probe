@@ -158,11 +158,25 @@ fn register_on_collector(engine: &mut Engine) {
         DECLARATIONS.with(|d| d.borrow_mut().push((event, key, handler.clone())));
         Ok(handler)
     });
-    // Ctx-fn stubs for the introspection throwaway engine: scripts
-    // reference `ctx_*` host fns at load time (steel resolves free
-    // identifiers when the define is compiled), but the host bridge is
-    // not available here — introspection never CALLS a handler, the
-    // stubs only make the script load. Error values if ever invoked.
+}
+
+/// Bind collected handlers under their event names (register_value —
+/// dotted names are fine: env lookup is by string, not parser ident).
+fn bind_event_handlers(engine: &mut Engine) {
+    DECLARATIONS.with(|d| {
+        for (event, _key, handler) in d.borrow().iter() {
+            engine.register_value(event, handler.clone());
+        }
+    });
+}
+
+/// Ctx-fn stubs for the introspection throwaway engine ONLY (never the
+/// resident session — there the real host bridge functions must win):
+/// scripts reference `ctx_*` host fns at load time (steel resolves free
+/// identifiers when the define is compiled), but the host bridge is not
+/// available during introspection. The stubs exist so the script loads;
+/// they error if ever invoked (introspection never calls a handler).
+fn register_ctx_stubs(engine: &mut Engine) {
     const CTX_STUBS: &[&str] = &[
         "ctx_state_get", "ctx_state_set", "ctx_state_delete",
         "ctx_invoke", "ctx_store_emit", "ctx_interface_schema",
@@ -174,16 +188,6 @@ fn register_on_collector(engine: &mut Engine) {
             Err("ctx function called during introspection (no host bridge)".to_string())
         });
     }
-}
-
-/// Bind collected handlers under their event names (register_value —
-/// dotted names are fine: env lookup is by string, not parser ident).
-fn bind_event_handlers(engine: &mut Engine) {
-    DECLARATIONS.with(|d| {
-        for (event, _key, handler) in d.borrow().iter() {
-            engine.register_value(event, handler.clone());
-        }
-    });
 }
 
 fn collected() -> Vec<(String, String)> {
@@ -202,6 +206,7 @@ fn collected() -> Vec<(String, String)> {
 pub fn introspect(source: &str) -> ExecResult {
     let mut engine = Engine::new();
     register_on_collector(&mut engine);
+    register_ctx_stubs(&mut engine);
     engine
         .run(source.to_owned())
         .map_err(|e| anyhow::anyhow!("steel load: {e:?}"))?;
