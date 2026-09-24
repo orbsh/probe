@@ -49,6 +49,20 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
         }
     })?;
     module.add("on", on)?;
+
+    // ---- Schema-declaration decorators (ADR-0026 §4) ----
+    // The DSL lives in okm (okm-python's OKM_SCHEMA_PY — one source, every
+    // host injects the same module): exec it into the actor's module
+    // namespace so `@KeyEncode` / `@DocumentEncode` / `@ok_*` resolve.
+    let globals = module.dict();
+    globals.set_item("__name__", "operation")?;
+    py.run(
+        CString::new(okm::OKM_SCHEMA_PY)?.as_c_str(),
+        Some(&globals),
+        Some(&globals),
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("okm schema DSL: {e}")))?;
+
     // Execute the module body with the module dict as globals so the
     // decorators resolve `on` (bound above, before the body runs).
     let globals = module.dict();
@@ -61,6 +75,7 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
     // (lifecycle, ...). One `interface_schema` name on the module either
     // way — aura's call path is uniform across languages.
     let reg_handle: Py<PyList> = registry.clone().unbind();
+    let module_handle2 = module.clone().unbind();
     let explicit_fn: Option<Py<PyAny>> = module
         .getattr("interface_schema")
         .ok()
@@ -86,18 +101,42 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
             }
             receives.insert(pair.0, Value::Object(entry));
         }
-        let derived = Value::Object([
+        let mut merged = Value::Object([
             ("receives".to_string(), Value::Object(receives)),
             ("wildcard_receives".to_string(), Value::Array(wildcards)),
         ].into_iter().collect());
+        // Decorator-derived storage half: assemble every
+        // `@DocumentEncode` class on the module (the okm DSL) into
+        // CollectionSchema serde JSON. Empty block omitted so it cannot
+        // shadow an explicit-only storage declaration (merge_schema's
+        // or_insert keeps the first key seen).
+        let module_dict = module_handle2.bind(py).dict();
+        let storage_py = py.eval(
+            CString::new("assemble_module(globals())")?.as_c_str(),
+            Some(&module_dict),
+            Some(&module_dict),
+        )?;
+        let storage = json_from_py(py, &storage_py)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        if let Value::Object(colls) = &storage {
+            if let Some(colls) = colls.get("collections").and_then(|c| c.as_object()) {
+                if !colls.is_empty() {
+                    if let Value::Object(merged_map) = &mut merged {
+                        merged_map.insert("storage".into(), storage);
+                    }
+                }
+            }
+        }
         // Explicit half: call the script's captured declaration, if any.
-        let mut merged = derived.clone();
+        // Decorator storage WINS over an explicit storage block (the
+        // class definitions are the authoritative DDL — the explicit half
+        // contributes lifecycle and the like).
         if let Some(f) = &explicit_fn {
             let r = f.bind(py).call1((py.None(),))
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("interface_schema: {e}")))?;
             let explicit_v = json_from_py(py, &r)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            merged = merge_schema(derived.clone(), explicit_v);
+            merged = merge_schema(merged, explicit_v);
         }
         json_to_py(py, &merged).map(|v| v.unbind())
     })?;
@@ -201,7 +240,7 @@ pub fn introspect(source: &str) -> ExecResult {
 /// the authoritative source for receives, the explicit half contributes
 /// everything else (lifecycle, ...).
 fn merge_schema(derived: Value, explicit: Value) -> Value {
-    let mut out = match (derived, explicit) {
+    let out = match (derived, explicit) {
         (Value::Object(mut d), Value::Object(e)) => {
             for (k, v) in e {
                 d.entry(k).or_insert(v);
