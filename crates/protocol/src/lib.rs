@@ -132,9 +132,6 @@ pub struct HostCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HostOp {
-    StateGet { field: String },
-    StateSet { field: String, value: serde_json::Value },
-    StateDelete { field: String },
     Invoke {
         target_type: String,
         target_key: String,

@@ -177,7 +177,7 @@ fn build_host_bridge(
     let tx = tx.clone();
     let pending = pending_host.clone();
     let mut bridge = HostBridge::default();
-    for name in ["ctx_state_get", "ctx_state_set", "ctx_state_delete", "ctx_invoke"] {
+    for name in ["ctx_invoke"] {
         let tx = tx.clone();
         let pending = pending.clone();
         let call_id = call_id.clone();
@@ -186,47 +186,6 @@ fn build_host_bridge(
             let host_call_id = format!("host-{}", std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?.as_nanos());
             let op = match name {
-                "ctx_state_get" => {
-                    // Steel passes a JSON string arg; python passes the
-                    // decoded value. Normalize: field name from string or
-                    // object {"field": ...}.
-                    let field = match &arg {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Object(m) => m
-                            .get("field")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        _ => arg.to_string(),
-                    };
-                    HostOp::StateGet { field }
-                }
-                "ctx_state_set" => {
-                    let m = match &arg {
-                        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
-                            .unwrap_or(serde_json::Value::Null),
-                        other => other.clone(),
-                    };
-                    let field = m
-                        .get("field")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let value = m.get("value").cloned().unwrap_or(serde_json::Value::Null);
-                    HostOp::StateSet { field, value }
-                }
-                "ctx_state_delete" => {
-                    let field = match &arg {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Object(m) => m
-                            .get("field")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        _ => arg.to_string(),
-                    };
-                    HostOp::StateDelete { field }
-                }
                 "ctx_invoke" => {
                     let m = match &arg {
                         serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
