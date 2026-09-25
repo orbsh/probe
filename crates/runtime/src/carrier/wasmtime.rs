@@ -78,22 +78,41 @@ impl WasmSession {
                 // blocking closure by contract — every caller site runs
                 // under spawn_blocking (the ctx bridge blocks on the async
                 // ctx inside it). No async host import machinery needed.
+                // `emit` is the RAW-BYTE host arm (ADR-0026 §4 wasm
+                // storage): the guest hands over okm-wire OpFrame bytes —
+                // NOT a CBOR value — and expects raw OpResponse bytes
+                // back. The JSON HostFn seam carries the bytes as JSON
+                // number arrays (lossless; the storage bridge is not a
+                // hot path at the JSON-detour cost). Every other host fn
+                // keeps the CBOR value marshal.
+                let is_emit = name == "emit";
                 linker
                     .func_wrap(
                         HOST_NS,
                         name,
                         move |mut caller: Caller<'_, State>, ptr: i32, len: i32| -> Result<i64> {
-                            // The guest handed us (ptr, len) of its CBOR
-                            // argument in linear memory.
                             let arg_bytes = read_host_memory(&mut caller, ptr, len)?;
-                            let arg: Value = ciborium::from_reader(&arg_bytes[..])?;
+                            let arg: Value = if is_emit {
+                                Value::Array(arg_bytes.iter().map(|b| Value::from(*b)).collect())
+                            } else {
+                                ciborium::from_reader(&arg_bytes[..])?
+                            };
                             let out = f(arg)?;
 
                             // Write the reply back through the guest's
                             // allocator (the guest reads it after resume).
                             let (mem, alloc) = guest_facilities(&mut caller)?;
-                            let mut reply = Vec::new();
-                            ciborium::into_writer(&out, &mut reply)?;
+                            let reply: Vec<u8> = if is_emit {
+                                out.as_array()
+                                    .ok_or_else(|| anyhow!("emit host fn must return a byte array"))?
+                                    .iter()
+                                    .map(|v| v.as_u64().map(|x| x as u8).ok_or_else(|| anyhow!("emit reply byte")))
+                                    .collect::<Result<Vec<u8>>>()?
+                            } else {
+                                let mut r = Vec::new();
+                                ciborium::into_writer(&out, &mut r)?;
+                                r
+                            };
                             let rptr = write_guest(&mem, &alloc, &mut caller, &reply)?;
                             Ok(pack(rptr as u32, reply.len() as u32))
                         },

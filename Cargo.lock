@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "actor-guest"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "okm-core",
+ "okm-wire",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2718,7 +2729,9 @@ dependencies = [
  "hex",
  "im-rc",
  "libc",
+ "okm-core",
  "okm-python",
+ "okm-wire",
  "probe-config",
  "probe-protocol",
  "pyo3",

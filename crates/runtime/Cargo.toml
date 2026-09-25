@@ -35,3 +35,6 @@ nushell = []
 
 [dev-dependencies]
 tempfile = "3"
+okm-core = { git = "https://github.com/orbsh/okm", default-features = false, features = ["test-engines"] }
+okm-wire = { git = "https://github.com/orbsh/okm" }
+base64 = "0.22"

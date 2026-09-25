@@ -78,12 +78,24 @@ pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
             // Explicit `interface_schema` export wins; otherwise the
             // receives half derives from the export list. One throwaway
             // session, same shape as every carrier's introspection.
+            // The bridge carries a STUB `emit` (the steel register_ctx_stubs
+            // precedent): a wasm storage module imports aura_host.emit, but
+            // at introspection time no store plan exists — the import must
+            // be satisfied for instantiation without being callable (the
+            // schema export is a pure declaration, never an emit).
+            let mut stub = HostBridge::default();
+            stub.functions.insert(
+                "emit".into(),
+                std::sync::Arc::new(|_arg: Value| {
+                    anyhow::bail!("emit is not callable during introspection")
+                }),
+            );
             let sessions = session::Sessions::new();
             sessions.with_session(
                 "__introspect",
                 language,
                 source,
-                None,
+                Some(&stub),
                 &crate::sandbox::SandboxPolicy::None,
                 |s: &mut dyn crate::carrier::session::ResidentSession| match s
                     .as_any()
