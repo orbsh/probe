@@ -246,12 +246,46 @@ pub fn introspect(source: &str) -> ExecResult {
 
 /// Field-wise merge: the derived (collector) half wins on its keys;
 /// the explicit half contributes everything else (lifecycle, ...).
+/// `receives` is deep-merged key-by-key — a top-level `or_insert` would
+/// let the collector's (empty) map shadow an explicit hand-written
+/// receives block, silently dropping it (python's module-side merge
+/// composes both sources into one map; steel merges here).
 fn merge_schema(derived: Value, explicit: Value) -> Value {
+    fn deep_merge_receives(d: &mut serde_json::Map<String, Value>, e: &serde_json::Map<String, Value>) {
+        for k in ["receives", "wildcard_receives"] {
+            match (d.get_mut(k), e.get(k)) {
+                // receives: a map — explicit entries contribute keys the
+                // collector did not declare (collision: collector wins).
+                (Some(Value::Object(dm)), Some(Value::Object(em))) => {
+                    for (ek, ev) in em {
+                        dm.entry(ek.clone()).or_insert_with(|| ev.clone());
+                    }
+                }
+                // wildcard_receives: an array of patterns — set union.
+                (Some(Value::Array(da)), Some(Value::Array(ea))) => {
+                    for pat in ea {
+                        if !da.contains(pat) {
+                            da.push(pat.clone());
+                        }
+                    }
+                }
+                // Derived side missing or differently shaped: take explicit.
+                (None | Some(Value::Null), Some(v)) => {
+                    d.insert(k.to_string(), v.clone());
+                }
+                _ => {}
+            }
+        }
+    }
     match (derived, explicit) {
         (Value::Object(mut d), Value::Object(e)) => {
-            for (k, v) in e {
-                d.entry(k).or_insert(v);
+            for (k, v) in &e {
+                if k == "receives" || k == "wildcard_receives" {
+                    continue; // deep-merged below
+                }
+                d.entry(k.clone()).or_insert_with(|| v.clone());
             }
+            deep_merge_receives(&mut d, &e);
             Value::Object(d)
         }
         (d, _) => d,
