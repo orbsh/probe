@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use std::io::Read as _;
 use futures_util::{SinkExt, StreamExt};
 use probe_config::ProbeConfig;
-use probe_protocol::{CodePayload, Frame, HostCall, HostFrame, HostOp, ToolCall, ToolResult};
+use probe_protocol::{CodeRef, Frame, HostCall, HostFrame, HostOp, ToolCall, ToolResult};
+use std::sync::Mutex as StdMutex;
 use crate::carrier::session::Sessions;
 use crate::carrier::HostBridge;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ async fn serve_connection(
     credential: &str,
     config: &ProbeConfig,
     sessions: &Sessions,
+    code_cache: &Arc<CodeCache>,
 ) -> Result<()> {
     let pending_host: Arc<PendingHost> = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let (ws, _) = tokio_tungstenite::connect_async(ws_url)
@@ -72,10 +74,13 @@ async fn serve_connection(
                 let pending_host = pending_host.clone();
                 let config = config.clone();
                 let sessions = sessions.clone();
+                let code_cache = code_cache.clone();
                 // One session task per call; host calls it makes run
                 // concurrently over the same writer channel.
                 tokio::spawn(async move {
-                    let result = execute_call(&config, &sessions, &call, &tx, &pending_host).await;
+                    let result =
+                        execute_call(&config, &sessions, &call, &tx, &pending_host, &code_cache)
+                            .await;
                     let _ = tx.send(Frame::Result(ToolResult {
                         call_id: call.call_id.clone(),
                         outcome: result,
@@ -111,8 +116,9 @@ async fn execute_call(
     call: &ToolCall,
     tx: &tokio::sync::mpsc::UnboundedSender<Frame>,
     pending_host: &Arc<PendingHost>,
+    code_cache: &Arc<CodeCache>,
 ) -> Result<serde_json::Value, String> {
-    execute_call_inner(config, sessions, call, tx, pending_host)
+    execute_call_inner(config, sessions, call, tx, pending_host, code_cache)
         .await
         .map_err(|e| e.to_string())
 }
@@ -123,18 +129,14 @@ async fn execute_call_inner(
     call: &ToolCall,
     tx: &tokio::sync::mpsc::UnboundedSender<Frame>,
     pending_host: &Arc<PendingHost>,
+    code_cache: &Arc<CodeCache>,
 ) -> Result<serde_json::Value> {
-    // Two payload forms (Phase 4): inline bytes ride the frame; link
-    // payloads are fetched by content-hash URL — the URL is its own
-    // invalidation policy, the hash verifies the bytes (zero cache: the
-    // probe holds nothing between calls and initiates no fetch of its own
-    // beyond the declared one).
-    let bytes = match &call.code {
-        CodePayload::Inline { bytes } => bytes.clone(),
-        CodePayload::Link { url, expected_sha256, .. } => fetch_link(url, expected_sha256)?,
-    };
-    let source = String::from_utf8(bytes)
-        .context("code payload is not valid UTF-8")?;
+    // Content-addressed code (ADR-0027): the frame carries a reference,
+    // bytes ride the data path. Resolve = per-hash cache hit, else fetch +
+    // verify (mismatch = error, never silent). The cache is a discardable
+    // hot layer — same legitimacy tier as the resident session; nothing
+    // in it would need to be recovered.
+    let source = code_cache.resolve(&call.code)?;
 
     // Args carry no partition here — the control plane's actor model owns
     // partitioning; the probe only keys residency by the caller's session
@@ -229,10 +231,47 @@ fn build_host_bridge(
 
 
 
-/// Fetch a Link payload: GET the URL, verify sha256 against the expected
-/// hash (hex). The content-hash URL means a mismatch is either tampering
-/// or a stale resolution — both are errors, never a silent accept.
-fn fetch_link(url: &str, expected_sha256: &str) -> anyhow::Result<Vec<u8>> {
+/// Per-hash code cache (ADR-0027): resolved bytes keyed by the asserted
+/// hash. Content addressing makes eviction semantics trivial — a stale
+/// entry is unreachable waste (new code is a new hash, a new key), so the
+/// cache grows with distinct code, never with call count. Survives
+/// reconnection (lives at `run` scope); a process start begins empty.
+pub struct CodeCache {
+    entries: StdMutex<std::collections::HashMap<String, Arc<str>>>,
+}
+
+impl CodeCache {
+    pub fn new() -> Self {
+        Self { entries: StdMutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// Resolve a reference to source text: cache hit, or fetch + verify +
+    /// insert. A hash mismatch is tampering or a stale resolution — an
+    /// error, never a silent accept.
+    pub fn resolve(&self, code: &CodeRef) -> anyhow::Result<String> {
+        if let Some(hit) = self.entries.lock().unwrap().get(&code.sha256) {
+            return Ok(hit.to_string());
+        }
+        let bytes = fetch_verified(&code.url, &code.sha256)?;
+        let source = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("fetched code is not valid UTF-8"))?;
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(code.sha256.clone(), Arc::from(source.as_str()));
+        Ok(source)
+    }
+}
+
+impl Default for CodeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fetch by reference: GET the URL, verify sha256 against the expected
+/// hash (hex, asserted by the frame — never parsed from the URL).
+fn fetch_verified(url: &str, expected_sha256: &str) -> anyhow::Result<Vec<u8>> {
     let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(30))
         .call()
@@ -258,6 +297,7 @@ pub async fn run(config: ProbeConfig) -> Result<()> {
     let credential = std::env::var(&config.credential_env)
         .with_context(|| format!("credential env var {} not set", config.credential_env))?;
     let sessions = Sessions::new();
+    let code_cache = Arc::new(CodeCache::new());
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
         match serve_connection(
@@ -265,6 +305,7 @@ pub async fn run(config: ProbeConfig) -> Result<()> {
             &credential,
             &config,
             &sessions,
+            &code_cache,
         )
         .await
         {

@@ -46,8 +46,29 @@ pub struct ToolCall {
     /// (data-path discipline).
     pub args: serde_json::Value,
     /// The operation's code. Always present: there is no native-operation
-    /// path — the Probe provides runtimes, not logic.
-    pub code: CodePayload,
+    /// path — the Probe provides runtimes, not logic. One delivery form
+    /// (ADR-0027): bytes left the control frame — code is content-
+    /// addressed, every remote call rides a reference.
+    pub code: CodeRef,
+}
+
+/// The operation's code by content address (ADR-0027 — replaces the old
+/// Inline/Link enum; one option means no option to choose).
+///
+/// `url` is assembled by the control plane from a deployment-declared
+/// prefix plus the hash (the serving endpoint exposes content ONLY under
+/// its own `/{hash}` path, so the URL is self-verifying by construction).
+/// `sha256` is asserted BY THIS FRAME, never parsed from the URL: a CDN
+/// may rewrite the path, and verification derived from a transport detail
+/// stands on the wrong side. The probe fetches on demand, verifies
+/// against this hash (mismatch = error, never a silent accept), and
+/// caches by hash — a discardable hot layer, same legitimacy tier as the
+/// resident session itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeRef {
+    pub url: String,
+    /// Lowercase hex.
+    pub sha256: String,
 }
 
 /// The Probe's answer, message-sized by discipline.
@@ -59,27 +80,6 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub call_id: String,
     pub outcome: Result<serde_json::Value, String>,
-}
-
-/// Executable code delivered with an operation.
-///
-/// Small scripts (py/steel, KB-scale) ride inline in the frame. Larger
-/// artifacts (Wasm, MB-scale) go by versioned URL: content-hash version, so
-/// the URL is its own invalidation policy (CDN-friendly caching, not a
-/// Probe-side code cache). When only the WS channel is reachable, the
-/// control plane assembles `link` as chunked delivery over the same frames;
-/// the Probe consumes whichever form is declared.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum CodePayload {
-    /// Bytes in the frame.
-    Inline { bytes: Vec<u8> },
-    /// URL + content-hash version + expected hash.
-    Link {
-        url: String,
-        version: String,
-        expected_sha256: String,
-    },
 }
 
 

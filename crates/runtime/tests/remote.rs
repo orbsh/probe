@@ -2,14 +2,14 @@
 //! Register -> Registered -> push one ToolCall -> assert the ToolResult.
 
 use probe_config::{CapabilitySurface, NetworkPolicy, ProbeConfig};
-use probe_protocol::{CodePayload, Frame, ToolCall, ToolResult};
+use probe_protocol::{CodeRef, Frame, ToolCall, ToolResult};
 use probe_runtime::remote;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 
-async fn fake_control_plane(listener: TcpListener) {
+async fn fake_control_plane(listener: TcpListener, code: CodeRef) {
     let (stream, _) = listener.accept().await.unwrap();
     let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
     let (mut sink, mut stream) = ws.split();
@@ -39,13 +39,7 @@ async fn fake_control_plane(listener: TcpListener) {
         entry: "counter".into(),
         language: "steel".into(),
         args: serde_json::json!({"n": 3}),
-        code: CodePayload::Inline {
-            bytes: br#"
-(define (counter args)
-  (hash "doubled" (* 2 (hash-ref args "n"))))
-"#
-            .to_vec(),
-        },
+        code: code.clone(),
     };
     sink.send(Message::Text(
         serde_json::to_string(&Frame::Call(call)).unwrap(),
@@ -68,9 +62,25 @@ async fn fake_control_plane(listener: TcpListener) {
 
 #[tokio::test]
 async fn outbound_registration_and_task_downlink() {
+    // Code is content-addressed (ADR-0027): the fake plane sends a
+    // reference; the bytes live behind a local HTTP source.
+    let code_bytes = br#"
+(define (counter args)
+  (hash "doubled" (* 2 (hash-ref args "n"))))
+"#
+    .to_vec();
+    let (code_port, _sha, _hits) = serve_code(code_bytes.clone());
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&code_bytes);
+    let sha = hex::encode(hasher.finalize());
+    let code = CodeRef {
+        url: format!("http://127.0.0.1:{code_port}/code"),
+        sha256: sha,
+    };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(fake_control_plane(listener));
+    let server = tokio::spawn(fake_control_plane(listener, code));
 
     let config = ProbeConfig {
         control_plane_url: format!("ws://127.0.0.1:{port}"),
@@ -92,20 +102,26 @@ async fn outbound_registration_and_task_downlink() {
     server.await.unwrap();
 }
 
-// ---------------------------------------------- Phase 4: Link payloads ----
+// --------------------------------- ADR-0027: content-addressed payloads ----
 
-/// Serve code bytes over plain HTTP once; returns (port, sha256 hex).
-fn serve_code(bytes: Vec<u8>) -> (u16, String) {
+/// Serve code bytes over plain HTTP (any number of requests — the probe's
+/// per-hash cache must keep request count at ONE across repeated calls of
+/// the same code); returns (port, sha256 hex, hits).
+fn serve_code(bytes: Vec<u8>) -> (u16, String, Arc<std::sync::atomic::AtomicUsize>) {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(&bytes);
     let sha = hex::encode(hasher.finalize());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits2 = hits.clone();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
+            hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let body = bytes.clone();
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -115,18 +131,19 @@ fn serve_code(bytes: Vec<u8>) -> (u16, String) {
             let _ = stream.write_all(&body);
         }
     });
-    (port, sha)
+    (port, sha, hits)
 }
 
 use std::io::{Read as _, Write as _};
 
 #[tokio::test]
-async fn link_payload_fetch_verify_and_mismatch_rejection() {
+async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
     let code = br#"
 (define (triple args)
   (hash "tripled" (* 3 (hash-ref args "n"))))
 "#.to_vec();
-    let (http_port, sha) = serve_code(code);
+    let (http_port, sha, hits) = serve_code(code);
+    let hits_check = hits.clone();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_port = listener.local_addr().unwrap().port();
@@ -149,10 +166,9 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
             entry: "triple".into(),
             language: "steel".into(),
             args: serde_json::json!({"n": 5}),
-            code: CodePayload::Link {
+            code: CodeRef {
                 url: format!("http://127.0.0.1:{http_port}/code"),
-                version: "v1".into(),
-                expected_sha256: sha,
+                sha256: sha.clone(),
             },
         };
         sink.send(Message::Text(serde_json::to_string(&Frame::Call(call)).unwrap()))
@@ -167,6 +183,37 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
             other => panic!("expected Result, got {other:?}"),
         }
 
+        // A SECOND call with the SAME code (new session so the resident
+        // load actually re-resolves): the per-hash cache must serve it —
+        // the HTTP source stays at exactly one hit across the exchange.
+        let call = ToolCall {
+            call_id: "c-cached".into(),
+            session: "triple/k2".into(),
+            entry: "triple".into(),
+            language: "steel".into(),
+            args: serde_json::json!({"n": 2}),
+            code: CodeRef {
+                url: format!("http://127.0.0.1:{http_port}/code"),
+                sha256: sha.clone(),
+            },
+        };
+        sink.send(Message::Text(serde_json::to_string(&Frame::Call(call)).unwrap()))
+            .await
+            .unwrap();
+        let msg = stream.next().await.unwrap().unwrap();
+        match serde_json::from_str::<Frame>(msg.to_text().unwrap()).unwrap() {
+            Frame::Result(r) => {
+                assert_eq!(r.call_id, "c-cached");
+                assert_eq!(r.outcome.unwrap(), serde_json::json!({"tripled": 6}));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(
+            hits_check.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "repeat of the same code resolves from the hash cache, not the source"
+        );
+
         // Link call with a WRONG hash: error value, never a silent accept.
         let call = ToolCall {
             call_id: "c-bad".into(),
@@ -174,10 +221,9 @@ async fn link_payload_fetch_verify_and_mismatch_rejection() {
             entry: "triple".into(),
             language: "steel".into(),
             args: serde_json::json!({"n": 5}),
-            code: CodePayload::Link {
+            code: CodeRef {
                 url: format!("http://127.0.0.1:{http_port}/code"),
-                version: "v1".into(),
-                expected_sha256: "deadbeef".into(),
+                sha256: "deadbeef".into(),
             },
         };
         sink.send(Message::Text(serde_json::to_string(&Frame::Call(call)).unwrap()))
