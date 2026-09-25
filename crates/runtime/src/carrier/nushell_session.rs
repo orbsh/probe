@@ -11,6 +11,12 @@ use serde_json::Value;
 pub struct NushellSession {
     fd: i32,
     pid: i32,
+    /// The ctx bridge (nushell carrier): host functions answered through
+    /// the session directory's request/response files. `None` = pure
+    /// session (no bridge materialized, no sweeping).
+    pub bridge: Option<std::sync::Arc<super::HostBridge>>,
+    /// The session directory (bridge.nu + req/resp files live here).
+    pub dir: Option<std::path::PathBuf>,
 }
 
 impl NushellSession {
@@ -76,9 +82,16 @@ impl NushellSession {
             }
         }
         unsafe { libc::close(slave) };
-        let session = Self { fd: master, pid };
+        let session = Self { fd: master, pid, bridge: None, dir: None };
         session.pump(2.5); // banner + first prompt
         Ok(session)
+    }
+
+    /// Attach the ctx bridge: the session dir where req/resp files live
+    /// and the host functions the sweep answers.
+    pub fn set_bridge(&mut self, bridge: std::sync::Arc<super::HostBridge>, dir: std::path::PathBuf) {
+        self.bridge = Some(bridge);
+        self.dir = Some(dir);
     }
 
     /// Load the actor module (defines the handler functions).
@@ -116,8 +129,10 @@ impl NushellSession {
         std::fs::write(&wrapper_path, wrapper)?;
         self.send(&format!("source '{}'\r\n", wrapper_path.display()));
 
-        // Poll for the result file, keeping the session responsive.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Poll for the result file, keeping the session responsive and
+        // answering ctx-bridge request files (a handler blocked inside a
+        // ctx-invoke poll is exactly the case the bridge exists for).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut raw: Option<String> = None;
         while raw.is_none() {
             if std::time::Instant::now() >= deadline {
@@ -126,6 +141,7 @@ impl NushellSession {
             if let Ok(text) = std::fs::read_to_string(&result_path) {
                 raw = Some(text);
             } else {
+                self.sweep_bridge_requests();
                 self.pump(0.1);
             }
         }
@@ -133,6 +149,13 @@ impl NushellSession {
         let _ = std::fs::remove_file(&args_path);
         let _ = std::fs::remove_file(&result_path);
         let _ = std::fs::remove_file(&wrapper_path);
+        // The result file appears while the REPL is still finishing the
+        // wrapper (prompt redraw + the `ESC[6n` cursor query it answers
+        // against). Returning now leaves that query unanswered and the
+        // NEXT call's `source` line lands in a half-drawn prompt — the
+        // second bridge turn then never executes (locked by nu_twocall).
+        // Drain until the prompt is back before handing the session over.
+        self.pump_quiet(1.0);
         Ok(serde_json::from_str(raw.trim())?)
     }
 
@@ -157,6 +180,72 @@ impl NushellSession {
                     Err(_) => break,
                 }
             }
+        }
+    }
+
+    /// Drain until the stream goes quiet (prompt redraw finished), so the
+    /// session is handed back with the REPL idle. `t` bounds the wait.
+    fn pump_quiet(&self, t: f64) {
+        let mut buf = vec![0u8; 65536];
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(t);
+        while std::time::Instant::now() < end {
+            if poll_fd(self.fd, 0.15) {
+                match read_fd(self.fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if find_subslice(&buf[..n], b"\x1b[6n").is_some() {
+                            self.send("\x1b[1;1R");
+                        }
+                    }
+                    Err(_) => break,
+                }
+            } else {
+                break; // 150ms of silence: the prompt is settled
+            }
+        }
+    }
+
+    /// Answer pending ctx-bridge requests: for each `req-*.json` in the
+    /// session dir, look up the named HostFn, run it, write the reply to
+    /// `resp-<same>.json`, remove the request. Runs inside `call`'s poll
+    /// loop — the nu script is blocked polling its resp file, the slot
+    /// lock is ours, and HostFn calls may re-enter the realm (spawn_blocking
+    /// contract), so there is no deadlock.
+    fn sweep_bridge_requests(&self) {
+        let Some(dir) = &self.dir else { return };
+        let Some(bridge) = &self.bridge else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(n) if n.starts_with("req-") && n.ends_with(".json") => n,
+                _ => continue,
+            };
+            let resp_name = name.replacen("req-", "resp-", 1);
+            let resp_path = dir.join(&resp_name);
+            if resp_path.exists() {
+                continue; // already answered this pass
+            }
+            let Ok(body) = std::fs::read_to_string(entry.path()) else { continue };
+            let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = std::fs::write(&resp_path, serde_json::json!({ "__error": format!("bad request: {e}") }).to_string());
+                    continue;
+                }
+            };
+            let fn_name = parsed.get("fn").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let arg = parsed.get("arg").cloned().unwrap_or(serde_json::Value::Null);
+            let outcome = match bridge.functions.get(&fn_name) {
+                Some(f) => f(arg).map_err(|e| format!("{e:#}")),
+                None => Err(format!("unknown host function '{fn_name}'")),
+            };
+            let reply = match outcome {
+                Ok(v) => serde_json::json!({ "value": v }),
+                Err(e) => serde_json::json!({ "__error": e }),
+            };
+            let _ = std::fs::write(&resp_path, reply.to_string());
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

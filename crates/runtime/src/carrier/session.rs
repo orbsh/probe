@@ -100,7 +100,10 @@ fn spawn_session(
         #[cfg(feature = "python")]
         "python" => Box::new(super::python::PythonSession::new(host)?),
         #[cfg(feature = "nushell")]
-        "nushell" => Box::new(super::nushell::NushellResident::new(sandbox)?),
+        "nushell" => Box::new(super::nushell::NushellResident::new(
+            sandbox,
+            host.map(|h| std::sync::Arc::new(h.clone())),
+        )?),
         // Wasm compiles AT SPAWN (from_source) — its `load` is a no-op;
         // other carriers load lazily inside `load`. Same session shape.
         #[cfg(feature = "wasmtime")]
