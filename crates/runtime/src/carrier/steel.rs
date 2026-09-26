@@ -179,6 +179,7 @@ fn bind_event_handlers(engine: &mut Engine) {
 fn register_ctx_stubs(engine: &mut Engine) {
     const CTX_STUBS: &[&str] = &[
         "ctx_invoke", "ctx_store_emit", "ctx_interface_schema",
+        "ctx_queue_depth", "ctx_skip_to_now",
         "ctx_timer_register", "ctx_timer_cancel",
     ];
     for name in CTX_STUBS {
