@@ -248,7 +248,7 @@ fn merge_schema(derived: Value, explicit: Value) -> Value {
             Value::Object(d)
         }
         (d, Value::Object(e)) if e.is_empty() => d,
-        (d, e) => e.is_null().then_some(d).unwrap_or(e),
+        (d, e) => if e.is_null() { d } else { e },
     };
     // Deep-merge the receives maps: explicit receives entries that the
     // decorators did not declare still contribute (the script may know a
@@ -285,6 +285,9 @@ fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     })
 }
 
+// the `py` token rides ONLY into recursive calls (json_from_py walks
+// nested containers); it is load-bearing for the walk, not dead —
+#[allow(clippy::only_used_in_recursion)]
 fn json_from_py(py: Python<'_>, v: &Bound<'_, PyAny>) -> ExecResult {
     if v.is_none() {
         return Ok(Value::Null);

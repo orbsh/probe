@@ -5,7 +5,7 @@ use probe_config::{CapabilitySurface, NetworkPolicy, ProbeConfig};
 use probe_protocol::{CodeRef, Frame, ToolCall, ToolResult};
 use probe_runtime::remote;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 

@@ -143,7 +143,7 @@ async fn execute_call_inner(
     // identity (below).
     // Host bridge: ctx ops ride Frame::Host over the same connection, each
     // with a unique host_call_id; the closure awaits the correlated reply.
-    let bridge = build_host_bridge(call.call_id.clone(), &tx, pending_host);
+    let bridge = build_host_bridge(call.call_id.clone(), tx, pending_host);
     // Residency: the caller's session identity keys the resident runtime —
     // calls sharing a `session` share VM/module state, different ones never
     // do. The node alias in the key is only for readability (the registry is
@@ -179,7 +179,8 @@ fn build_host_bridge(
     let tx = tx.clone();
     let pending = pending_host.clone();
     let mut bridge = HostBridge::default();
-    for name in ["ctx_invoke"] {
+    {
+        let name = "ctx_invoke";
         let tx = tx.clone();
         let pending = pending.clone();
         let call_id = call_id.clone();

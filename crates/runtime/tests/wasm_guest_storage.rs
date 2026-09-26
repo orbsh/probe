@@ -26,11 +26,11 @@ mod storage {
     use okm_wire::{OpFrame, OpResponse, OP_DELETE, OP_GET, OP_PUT, OP_SCAN};
     use std::cell::RefCell;
 
-    /// The host-side engine: a REAL okm engine (TestStore matrix's
-    /// slatedb-mem), addressed by raw engine calls — exactly the bytes
-    /// the guest's Collection emitted. The realm's production executor
-    /// adds the declared-schema collection layer; this fixture answers
-    /// at the engine layer (the byte contract under test is the same).
+    // The host-side engine: a REAL okm engine (TestStore matrix's
+    // slatedb-mem), addressed by raw engine calls — exactly the bytes
+    // the guest's Collection emitted. The realm's production executor
+    // adds the declared-schema collection layer; this fixture answers
+    // at the engine layer (the byte contract under test is the same).
     thread_local! {
         static ENGINE: RefCell<TestStore> = RefCell::new(TestStore::default());
     }
@@ -39,7 +39,7 @@ mod storage {
         let parsed = OpFrame::decode(frame).expect("guest op frame");
         let mut out = OpResponse::default();
         ENGINE.with(|e| {
-            let mut store = e.borrow_mut();
+            let store = e.borrow_mut();
             for (tag, key, value) in &parsed.0 {
                 match *tag {
                     OP_PUT => store.put(key.clone(), value.clone()),
@@ -84,7 +84,7 @@ mod storage {
                     .collect();
                 let resp = exec_frame(&bytes);
                 let out = resp.encode();
-                Ok(Value::Array(out.into_iter().map(|b| Value::from(b)).collect()))
+                Ok(Value::Array(out.into_iter().map(Value::from).collect()))
             }) as HostFn,
         );
         bridge

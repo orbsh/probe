@@ -49,7 +49,7 @@ impl NushellSession {
                 libc::close(master);
                 match policy {
                     crate::sandbox::SandboxPolicy::None => {
-                        libc::execlp(b"nu\0".as_ptr() as *const libc::c_char, b"nu\0".as_ptr() as *const libc::c_char, b"--no-config-file\0".as_ptr() as *const libc::c_char, std::ptr::null::<libc::c_char>());
+                        libc::execlp(c"nu".as_ptr() as *const libc::c_char, c"nu".as_ptr() as *const libc::c_char, c"--no-config-file".as_ptr() as *const libc::c_char, std::ptr::null::<libc::c_char>());
                     }
                     crate::sandbox::SandboxPolicy::Bubblewrap { allow_write, deny_read, cwd, .. } => {
                         // bwrap mount policy from the sandbox config: fs
@@ -75,7 +75,7 @@ impl NushellSession {
                             Some("/bin/bash"),
                         ).expect("bwrap command");
                         let c0 = std::ffi::CString::new(wrapped).unwrap();
-                        libc::execlp(b"bash\0".as_ptr() as *const libc::c_char, b"bash\0".as_ptr() as *const libc::c_char, b"-c\0".as_ptr() as *const libc::c_char, c0.as_ptr(), std::ptr::null::<libc::c_char>());
+                        libc::execlp(c"bash".as_ptr() as *const libc::c_char, c"bash".as_ptr() as *const libc::c_char, c"-c".as_ptr() as *const libc::c_char, c0.as_ptr(), std::ptr::null::<libc::c_char>());
                     }
                 }
                 libc::_exit(127);

@@ -75,7 +75,7 @@ impl NushellResident {
             "# ctx bridge: host functions as file-round-trip commands\n",
         );
         for name in bridge.functions.keys() {
-            let cmd = name.replace('.', "-").replace('_', "-"); // nu forbids dots; underscores → dashes for the conventional ctx_* names
+            let cmd = name.replace(['.', '_'], "-"); // nu forbids dots; underscores → dashes for the conventional ctx_* names
             script.push_str(&format!(
                 r#"export def "{cmd}" [args] {{
     let req = {{ fn: "{name}", arg: $args }}

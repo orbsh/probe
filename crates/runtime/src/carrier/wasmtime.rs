@@ -256,8 +256,11 @@ fn compile(engine: &Engine, source: &str) -> Result<Module> {
     Module::new(engine, &bytes).map_err(|e| anyhow!("wasm compile: {e}"))
 }
 
+/// A guest-exported `i32 -> i32` function handle.
+type GuestFunc = TypedFunc<(i32,), (i32,)>;
+
 /// Resolve (memory, aura_alloc) from inside a host import's caller.
-fn guest_facilities(caller: &mut Caller<'_, State>) -> Result<(Memory, TypedFunc<(i32,), (i32,)>)> {
+fn guest_facilities(caller: &mut Caller<'_, State>) -> Result<(Memory, GuestFunc)> {
     let mem = caller
         .get_export(MEMORY)
         .and_then(|e| e.into_memory())
