@@ -86,7 +86,7 @@ fn round_trip(frame: &OpFrame) -> OpResponse {
 pub struct EmitStore;
 
 impl VirtualStorage for EmitStore {
-    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) {
         round_trip(&OpFrame::one(OP_PUT, key, value));
     }
 
@@ -94,7 +94,7 @@ impl VirtualStorage for EmitStore {
         round_trip(&OpFrame::one(OP_GET, key.to_vec(), Vec::new())).value
     }
 
-    fn del(&mut self, key: &[u8]) {
+    fn del(&self, key: &[u8]) {
         round_trip(&OpFrame::one(OP_DELETE, key.to_vec(), Vec::new()));
     }
 

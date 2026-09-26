@@ -2433,7 +2433,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#a64a9e0d79ffd05450fc7fe631c69221790965bf"
+source = "git+https://github.com/orbsh/okm#75557756420be065571f1fa1542a10bd8388da7f"
 dependencies = [
  "okm-derive",
  "okm-wire",
@@ -2448,7 +2448,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#a64a9e0d79ffd05450fc7fe631c69221790965bf"
+source = "git+https://github.com/orbsh/okm#75557756420be065571f1fa1542a10bd8388da7f"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -2459,7 +2459,7 @@ dependencies = [
 [[package]]
 name = "okm-dynamic"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#a64a9e0d79ffd05450fc7fe631c69221790965bf"
+source = "git+https://github.com/orbsh/okm#75557756420be065571f1fa1542a10bd8388da7f"
 dependencies = [
  "okm-core",
 ]
@@ -2467,7 +2467,7 @@ dependencies = [
 [[package]]
 name = "okm-python"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#a64a9e0d79ffd05450fc7fe631c69221790965bf"
+source = "git+https://github.com/orbsh/okm#75557756420be065571f1fa1542a10bd8388da7f"
 dependencies = [
  "okm-core",
  "okm-dynamic",
@@ -2478,7 +2478,7 @@ dependencies = [
 [[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#a64a9e0d79ffd05450fc7fe631c69221790965bf"
+source = "git+https://github.com/orbsh/okm#75557756420be065571f1fa1542a10bd8388da7f"
 
 [[package]]
 name = "once_cell"
@@ -4924,7 +4924,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
