@@ -138,7 +138,7 @@ async fn execute_call_inner(
     // in it would need to be recovered.
     let source = code_cache.resolve(&call.code)?;
 
-    // Args carry no partition here — the control plane's actor model owns
+    // Args carry no partition here — the control plane's booth model owns
     // partitioning; the probe only keys residency by the caller's session
     // identity (below).
     // Host bridge: ctx ops ride Frame::Host over the same connection, each

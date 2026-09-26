@@ -104,7 +104,7 @@ class User:
 }
 
 #[test]
-fn ns_is_omitted_for_actor_side_auto_allocation() {
+fn ns_is_omitted_for_booth_side_auto_allocation() {
     // aura injects the ns at registration (the type registry allocates it);
     // a class without @ok_ns still produces a valid schema — the ns rides
     // the plan, not the declaration.

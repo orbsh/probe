@@ -7,7 +7,7 @@ use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 
-/// Resident steel session: one VM per actor instance. The source runs ONCE
+/// Resident steel session: one VM per booth instance. The source runs ONCE
 /// at load (with the `on` collector bound and handlers bound under event
 /// names); every later call addresses a handler by name in the SAME VM —
 /// definitions, `define`s and other top-level state persist across calls.

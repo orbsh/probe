@@ -1,7 +1,7 @@
 //! actor-guest — the in-module storage kit for wasm (Rust source) actors
 //! (ADR-0026 §4 full-power path; PLAN 4.9 wasm schema item).
 //!
-//! A compiled actor module links this crate plus okm-core (static mode:
+//! A compiled booth module links this crate plus okm-core (static mode:
 //! `#[derive(KeyEncode/DocumentEncode)]` run at wasm build time, the
 //! schema IS code in the artifact) and implements its storage plane as
 //! one [`EmitStore`] — a `VirtualStorage` impl whose every primitive is

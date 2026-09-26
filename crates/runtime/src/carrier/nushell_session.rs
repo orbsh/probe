@@ -1,5 +1,5 @@
 //! Nushell PTY residency carrier (Phase 2.6 for nu): a long-lived nu REPL
-//! per actor instance in a pseudo-terminal. One `source` loads the module;
+//! per booth instance in a pseudo-terminal. One `source` loads the module;
 //! each call addresses the handler by name (multi-entry). Cross-call state
 //! lives in `$env` variables. Results travel via the filesystem, not the
 //! PTY stream — the stream is too noisy (echo, prompt redraws, OSC) to parse.
@@ -94,7 +94,7 @@ impl NushellSession {
         self.dir = Some(dir);
     }
 
-    /// Load the actor module (defines the handler functions).
+    /// Load the booth module (defines the handler functions).
     pub fn load(&mut self, script_path: &str) -> Result<()> {
         self.send(&format!("source '{}'\r\n", script_path));
         self.pump(1.5);

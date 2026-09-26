@@ -31,7 +31,7 @@ fn steel_explicit_receives_survive_merge() {
     // The shadowing bug this locks: the collector always contributes a
     // (possibly empty) `receives` map; the old top-level `or_insert` let
     // that empty map win, silently dropping a HAND-WRITTEN receives block
-    // — exactly the shape steel schema-literal actors declare (no `on`
+    // — exactly the shape steel schema-literal booths declare (no `on`
     // calls at all, PLAN 4.9 steel/nushell form).
     let src = r##"
 (define (interface_schema args)

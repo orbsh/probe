@@ -52,7 +52,7 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
 
     // ---- Schema-declaration decorators (ADR-0026 §4) ----
     // The DSL lives in okm (okm-python's OKM_SCHEMA_PY — one source, every
-    // host injects the same module): exec it into the actor's module
+    // host injects the same module): exec it into the booth's module
     // namespace so `@KeyEncode` / `@DocumentEncode` / `@ok_*` resolve.
     let globals = module.dict();
     globals.set_item("__name__", "operation")?;

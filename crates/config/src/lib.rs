@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Per-probe capability surface.
 ///
 /// The Probe ships NO built-in operations: every operation (`read_file`,
-/// `list_processes`, ...) is a user-written or AI-generated script/actor
+/// `list_processes`, ...) is a user-written or AI-generated script/booth
 /// delivered through a carrier. What this surface declares is (a) which
 /// carriers the node carries — the registration's capability list is
 /// exactly this — and (b) the scope constraints enforced on delivered

@@ -4,7 +4,7 @@ Skill runtime / remote actuator of the stateless agent architecture. Design: [st
 
 **Upstream-agnostic by iron rule**: probe never depends on Aura crates — all
 coupling with Aura is the frame protocol (serde types in `probe-protocol`).
-Any service that speaks the frames can drive it; the Aura Actor deployment
+Any service that speaks the frames can drive it; the Aura Booth deployment
 form lives entirely on the Aura side (connection-plane adapter).
 
 Control-plane integration (connect, handshake, every frame, and the obligations

@@ -101,7 +101,7 @@ The first frame the probe sends is `register`; the control plane must answer
 `session` is the caller's opaque **residency identity**: the Probe keys its
 resident runtime by it (`probe/<node_alias>/<session>`), so calls sharing a
 `session` share runtime state (VM / module globals) and calls with different
-values never do. It must be stable across calls — an upstream actor's `type/key`
+values never do. It must be stable across calls — an upstream booth's `type/key`
 is the natural value. The per-call `call_id` cannot serve here: it is unique per
 call, so residency keyed by it would start a cold runtime every time.
 
@@ -188,7 +188,7 @@ The mapping from script function to wire op:
 ```
 
 - `call_id` is the **enclosing** `call`'s id — that is how the control plane
-  resolves the ctx scope (which actor instance's fields are being read/written).
+  resolves the ctx scope (which booth instance's fields are being read/written).
   The Probe never needs to know its own instance key.
 - `host_call_id` is minted by the Probe, unique per host call. The response must
   echo it; a response with an unknown id is silently dropped.

@@ -24,7 +24,7 @@
 //! through the guest's `aura_alloc`, and returns the packed pointer.
 //!
 //! Source encoding: wasm modules are binary, but the session seam (and the
-//! persisted ActorDef) carries a String — so a module arrives either as
+//! persisted BoothDef) carries a String — so a module arrives either as
 //! WAT text (tests, hand-written fixtures; starts with `(module`) or as
 //! base64 of the raw `.wasm` bytes. Everything downstream is bytes.
 
@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 /// Guest-allocator export name and host-import namespace — the ABI
-/// contract between this carrier and compiled actor modules.
+/// contract between this carrier and compiled booth modules.
 pub const ALLOC: &str = "aura_alloc";
 pub const MEMORY: &str = "memory";
 pub const HOST_NS: &str = "aura_host";

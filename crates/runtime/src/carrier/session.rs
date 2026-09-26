@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use super::HostBridge;
 
-/// One resident session for an actor instance. Loaded once (source in),
+/// One resident session for an booth instance. Loaded once (source in),
 /// then each call addresses a handler by name with JSON args and gets a
 /// JSON result. Session state (defined vars, loaded code) persists across
 /// calls; eviction = drop.
 pub trait ResidentSession: Send {
-    /// Load the actor module (defines handlers / declarations).
+    /// Load the booth module (defines handlers / declarations).
     fn load(&mut self, source: &str) -> Result<()>;
     /// Invoke one handler by name with parsed JSON args.
     fn call(&mut self, handler: &str, args: &Value) -> Result<Value>;
@@ -29,7 +29,7 @@ pub trait ResidentSession: Send {
 /// (ctx_invoke) never contend on a global lock.
 type Slot = Mutex<Box<dyn ResidentSession>>;
 
-/// Session registry: per actor-instance key, one live session.
+/// Session registry: per booth-instance key, one live session.
 #[derive(Default, Clone)]
 pub struct Sessions {
     map: Arc<Mutex<HashMap<String, Arc<Slot>>>>,

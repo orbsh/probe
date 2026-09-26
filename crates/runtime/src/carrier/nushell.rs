@@ -1,4 +1,4 @@
-//! Nushell resident carrier: one nu REPL per actor instance in a PTY.
+//! Nushell resident carrier: one nu REPL per booth instance in a PTY.
 //! Wraps the low-level `NushellSession` (openpty/fork, reedline CPR
 //! answering, file-based result protocol). The old one-shot subprocess
 //! path is gone — resident sessions ARE the nushell carrier.
@@ -19,7 +19,7 @@ pub struct NushellResident {
     module_path: std::path::PathBuf,
     dir: std::path::PathBuf,
     /// The ctx bridge materialized as nu commands (`bridge.nu`), loaded
-    /// before the actor module so handlers resolve them.
+    /// before the booth module so handlers resolve them.
     bridge: Option<std::sync::Arc<super::HostBridge>>,
     bridge_path: std::path::PathBuf,
 }

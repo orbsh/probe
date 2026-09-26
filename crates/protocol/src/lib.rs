@@ -27,7 +27,7 @@ pub struct ToolCall {
     /// resident session by this value, so calls sharing a `session` share
     /// runtime state (VM / module globals) and calls with different values
     /// never do. The Probe derives nothing from it beyond identity — an
-    /// upstream actor's `type/key` is the natural value. It cannot be the
+    /// upstream booth's `type/key` is the natural value. It cannot be the
     /// per-call id: residency needs an identity that is stable across calls,
     /// or every call would start a cold runtime.
     pub session: String,
@@ -103,7 +103,7 @@ pub enum Frame {
     /// Bidirectional: a host-function round trip (ctx bridge over the
     /// wire). Probe -> control plane = Call, control plane -> probe =
     /// Result; the `host_call_id` correlates. The control plane resolves
-    /// the call against the ACTOR INSTANCE that the enclosing ToolCall was
+    /// the call against the BOOTH INSTANCE that the enclosing ToolCall was
     /// routed to (the gateway tracks call_id -> instance; ctx state is
     /// scoped to that instance's own fields).
     Host(HostFrame),
@@ -121,7 +121,7 @@ pub enum HostFrame {
 pub struct HostCall {
     pub host_call_id: String,
     /// The enclosing ToolCall's id — the control plane resolves the ctx
-    /// scope (actor instance) from it.
+    /// scope (booth instance) from it.
     pub call_id: String,
     pub op: HostOp,
 }

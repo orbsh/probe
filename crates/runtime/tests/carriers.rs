@@ -2,8 +2,8 @@
 //!
 //! Every carrier honors the same contract: JSON args in, JSON result out,
 //! handlers addressed by name, failures as error values (never panics).
-//! Execution is RESIDENT — one session per actor instance, loaded once,
-//! called per event. These tests double as the reference for how an actor
+//! Execution is RESIDENT — one session per booth instance, loaded once,
+//! called per event. These tests double as the reference for how a booth
 //! looks in each carried language.
 
 use probe_runtime::carrier::session::Sessions;
@@ -17,7 +17,7 @@ fn run(language: &str, src: &str, handler: &str, args: &serde_json::Value) -> an
 }
 
 // ---------------------------------------------------------------- python --
-// Actor shape: handlers defined and bound (via @on or plain def) at load;
+// Booth shape: handlers defined and bound (via @on or plain def) at load;
 // each event call invokes the handler by name with parsed args.
 #[cfg(feature = "python")]
 #[test]
@@ -51,7 +51,7 @@ fn py_missing_entry_is_error_value() {
 }
 
 // --------------------------------------------------------------- nushell --
-// Actor shape: a module exporting named functions (`def --env` for handlers
+// Booth shape: a module exporting named functions (`def --env` for handlers
 // that write $env state). Args arrive as one parsed value; results are
 // structured and travel via files (the PTY stream is discarded).
 #[cfg(feature = "nushell")]
@@ -80,7 +80,7 @@ export def sort_items [args] {
 }
 
 // ----------------------------------------------------------------- steel --
-// Actor shape: definitions plus handler lambdas; args arrive as a native
+// Booth shape: definitions plus handler lambdas; args arrive as a native
 // steel value (the carrier marshals at the boundary).
 #[cfg(feature = "steel")]
 #[test]
