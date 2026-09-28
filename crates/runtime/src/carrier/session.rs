@@ -173,6 +173,43 @@ impl Sessions {
     pub fn evict(&self, key: &str) {
         self.map.lock().unwrap().remove(key);
     }
+
+    /// Evict by predicate (the exec carrier's liveness rule): a slot whose
+    /// child DIED is a broken cache entry — remove it so the next call
+    /// cold-starts a fresh spawn. Dropping the exec session closes stdin
+    /// and reaps; a live child stays parked (idle_ttl eviction owns it —
+    /// the child is the residency). Returns the removed keys (diagnostics).
+    pub fn sweep_dead(&self) -> Vec<String> {
+        let mut map = self.map.lock().unwrap();
+        let dead: Vec<String> = map
+            .iter()
+            .filter_map(|(k, slot)| {
+                // try_lock: a slot mid-call is alive by definition (a
+                // request is running) — never block the sweep behind one.
+                slot.try_lock()
+                    .ok()
+                    .and_then(|mut s| {
+                        let dead = s
+                            .as_any()
+                            .downcast_mut::<crate::carrier::exec::ExecSession>()
+                            .map(|e| !e.is_alive())
+                            .unwrap_or(false);
+                        dead.then(|| k.clone())
+                    })
+            })
+            .collect();
+        for k in &dead {
+            map.remove(k);
+        }
+        dead
+    }
+}
+
+/// The exec spawn spec: whitespace-separated argv, no quoting layer
+/// (paths with spaces are the author's config problem, declared as a
+/// plain split — the spawn spec is a list of words by contract).
+fn shellish_split(source: &str) -> Vec<String> {
+    source.split_whitespace().map(|s| s.to_string()).collect()
 }
 
 fn spawn_session(
@@ -195,6 +232,23 @@ fn spawn_session(
             sandbox,
             host.map(|h| std::sync::Arc::new(h.clone())),
         )?),
+        // Exec (ADR-0035): the source string IS the argv (whitespace-
+        // separated, quoted-free — the spawn spec). Mode A: the child
+        // lives as long as the session; its argv[0] must speak the line
+        // protocol. Under a sandbox policy the whole spawn is bwrap-
+        // wrapped (the nushell PTY precedent — mount policy before exec).
+        "exec" => {
+            let argv: Vec<String> = shellish_split(source);
+            Box::new(super::exec::ExecSession::spawn_wrapped(&argv, host, sandbox)?)
+        }
+        // Mode B (ADR-0035 §2, the SKILL shape): one process per call,
+        // stdin closed at the request (EOF is the child's cue — nushell
+        // and other no-block-read-pipe runtimes land here; the ctx seam
+        // has no return path in B, matching the invoke-only downgrade).
+        "exec-b" => {
+            let argv: Vec<String> = shellish_split(source);
+            Box::new(super::exec::ExecSession::spawn_oneshot(&argv, host, sandbox)?)
+        }
         // Wasm compiles AT SPAWN (from_source) — its `load` is a no-op;
         // other carriers load lazily inside `load`. Same session shape.
         #[cfg(feature = "wasmtime")]

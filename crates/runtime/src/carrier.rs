@@ -46,6 +46,7 @@ pub mod wasmtime;
 pub mod nushell;
 #[cfg(feature = "nushell")]
 pub mod nushell_session;
+pub mod exec;
 pub mod session;
 
 /// Dispatch by declared language. Unknown language = error value, never a
