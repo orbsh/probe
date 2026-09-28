@@ -154,9 +154,11 @@ pub struct HostCall {
     pub op: HostOp,
 }
 
-/// The ctx surface scripts can reach, carried op-by-op. `state_*` touches
-/// the instance's own fields (cross-instance reach is not expressible);
-/// `invoke` rides the control plane's unified call model.
+/// The ctx surface scripts can reach, carried op-by-op. `invoke` and the
+/// iterate verbs ride the control plane's unified call model;
+/// `store_emit` carries one okm Collection instruction as data — the
+/// wire moves facts for the receiver to execute, it never parses them
+/// (the schema lives with the type registration).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HostOp {
@@ -181,6 +183,18 @@ pub enum HostOp {
     },
     IterateDispose {
         stream_id: String,
+    },
+    /// One okm Collection instruction (ADR-0026 §3's op document —
+    /// `{collection, op, …}` as the script wrote it), carried as DATA.
+    /// The probe never parses it: the schema lives with the type
+    /// registration on the control plane, the wire's job is to move the
+    /// instruction and deliver the answer. (Phase 4.14 gate 1.)
+    ///
+    /// The payload field is `instruction`, not `op` — the enum's
+    /// internally-tagged discriminator is already `op`, and a same-named
+    /// field would collide on the wire.
+    StoreEmit {
+        instruction: serde_json::Value,
     },
 }
 

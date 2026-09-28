@@ -168,22 +168,25 @@ The mapping from script function to wire op:
 
 | script fn | `op.op` | payload |
 |---|---|---|
-| `ctx_state_get` | `state_get` | `field` |
-| `ctx_state_set` | `state_set` | `field`, `value` |
-| `ctx_state_delete` | `state_delete` | `field` |
 | `ctx_invoke` | `invoke` | `target_type`, `target_key`, `handler`, `args` |
+| `ctx_iter_start` | `iterate` | `target_type`, `target_key`, `handler`, `args` |
+| `ctx_iter_next` | `iterate_next` | `stream_id` |
+| `ctx_iter_dispose` | `iterate_dispose` | `stream_id` |
+| `ctx_store_emit` | `store_emit` | `instruction` — one okm Collection instruction, carried as data (`{"collection": …, "op": …, …}` as the script wrote it; the control plane executes it against the type's own storage plan) |
 
 ```json
 {
   "type": "host", "kind": "call", "host_call_id": "h-1", "call_id": "rp-7",
-  "op": { "op": "state_get", "field": "visits" }
+  "op": { "op": "store_emit", "instruction": {
+      "collection": "counters", "doc": {"visits": 1}, "key": {"id": 1},
+      "op": "put_document" } }
 }
 ```
 
 ```json
 {
   "type": "host", "kind": "result", "host_call_id": "h-1",
-  "outcome": { "Ok": { "present": true, "value": 1 } }
+  "outcome": { "Ok": { "ok": true } }
 }
 ```
 
@@ -197,8 +200,9 @@ The mapping from script function to wire op:
   connection drops. Answer every `host` call.
 - Host calls arrive **while** the enclosing `call` is still running — a
   half-duplex "read a call, answer it, read the next" server cannot carry this.
-- `state_get` answers `{ "present": bool, "value": … }`, so scripts branch without
-  sentinel values.
+- `ctx_store_emit` is persistence over the wire: the probe never parses the
+  instruction (the schema lives with the type registration on the control
+  plane); a type with no declared storage answers an error string.
 
 ## 5. Obligations checklist
 
@@ -237,14 +241,15 @@ above; single-line here for the flow):
 probe → CP   {"type":"register","node_alias":"home-pc","credential":"tok-abc","carriers":["steel","python"]}
 CP → probe   {"type":"registered"}
 CP → probe   {"type":"call","call_id":"rp-7","session":"counter/k1","entry":"counter","language":"steel","args":{"n":4},"code":{"type":"inline","bytes":[40,100,101,102,105,110,101,32,40,101,120,101,99,117,116,101,32,97,114,103,115,41,32,40,104,97,115,104,32,34,110,34,32,52,41,41]}}
-probe → CP   {"type":"host","kind":"call","host_call_id":"h-1","call_id":"rp-7","op":{"op":"state_set","field":"visits","value":1}}
-CP → probe   {"type":"host","kind":"result","host_call_id":"h-1","outcome":{"Ok":null}}
+probe → CP   {"type":"host","kind":"call","host_call_id":"h-1","call_id":"rp-7","op":{"op":"store_emit","instruction":{"collection":"counters","doc":{"visits":1},"key":{"id":1},"op":"put_document"}}}
+CP → probe   {"type":"host","kind":"result","host_call_id":"h-1","outcome":{"Ok":{"ok":true}}}
 probe → CP   {"type":"result","call_id":"rp-7","outcome":{"Ok":{"n":4}}}
 ```
 
 (`bytes` is a byte array: the probe's code payload here is the steel source
 `(define (execute args) (hash "n" 4))`. The assembly is illustrative — a script
-that sets ctx state and then returns is just one of the shapes a call can take.)
+that emits one storage instruction and then returns is just one of the shapes a
+call can take.)
 
 ## 8. Failure semantics
 

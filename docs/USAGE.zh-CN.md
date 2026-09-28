@@ -123,22 +123,25 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 
 | 脚本函数 | `op.op` | 载荷 |
 |---|---|---|
-| `ctx_state_get` | `state_get` | `field` |
-| `ctx_state_set` | `state_set` | `field`、`value` |
-| `ctx_state_delete` | `state_delete` | `field` |
 | `ctx_invoke` | `invoke` | `target_type`、`target_key`、`handler`、`args` |
+| `ctx_iter_start` | `iterate` | `target_type`、`target_key`、`handler`、`args` |
+| `ctx_iter_next` | `iterate_next` | `stream_id` |
+| `ctx_iter_dispose` | `iterate_dispose` | `stream_id` |
+| `ctx_store_emit` | `store_emit` | `instruction` —— 一条 okm Collection 指令，作为数据承载（脚本写出的 `{"collection": …, "op": …, …}` 原样；控制端按该类型自己的存储计划执行） |
 
 ```json
 {
   "type": "host", "kind": "call", "host_call_id": "h-1", "call_id": "rp-7",
-  "op": { "op": "state_get", "field": "visits" }
+  "op": { "op": "store_emit", "instruction": {
+      "collection": "counters", "doc": {"visits": 1}, "key": {"id": 1},
+      "op": "put_document" } }
 }
 ```
 
 ```json
 {
   "type": "host", "kind": "result", "host_call_id": "h-1",
-  "outcome": { "Ok": { "present": true, "value": 1 } }
+  "outcome": { "Ok": { "ok": true } }
 }
 ```
 
@@ -146,7 +149,7 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 - `host_call_id` 由 Probe 铸造，每次宿主调用唯一。应答必须回显它；id 对不上的应答会被静默丢弃。
 - **脚本的宿主调用会一直阻塞到应答到达。** 这一侧没有 deadline：没人应答的 `host` 调用会卡住这次脚本调用，直到连接断开。每个 `host` 调用都要答。
 - 宿主调用会**在**外层 `call` 仍在执行时到达 —— "读一个 call、答一个、再读下一个"的半双工服务器承载不了这个。
-- `state_get` 应答 `{ "present": bool, "value": … }`，脚本由此分支，不需要哨兵值。
+- `ctx_store_emit` 是走线的持久化通道：probe 从不解析那条指令（schema 随类型注册住在控制端）；未声明存储的类型会收到错误字符串应答。
 
 ## 5. 义务清单
 
@@ -171,8 +174,8 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 probe → CP   {"type":"register","node_alias":"home-pc","credential":"tok-abc","carriers":["steel","python"]}
 CP → probe   {"type":"registered"}
 CP → probe   {"type":"call","call_id":"rp-7","session":"counter/k1","entry":"counter","language":"steel","args":{"n":4},"code":{"type":"inline","bytes":[40,100,101,102,105,110,101,32,40,101,120,101,99,117,116,101,32,97,114,103,115,41,32,40,104,97,115,104,32,34,110,34,32,52,41,41]}}
-probe → CP   {"type":"host","kind":"call","host_call_id":"h-1","call_id":"rp-7","op":{"op":"state_set","field":"visits","value":1}}
-CP → probe   {"type":"host","kind":"result","host_call_id":"h-1","outcome":{"Ok":null}}
+probe → CP   {"type":"host","kind":"call","host_call_id":"h-1","call_id":"rp-7","op":{"op":"store_emit","instruction":{"collection":"counters","doc":{"visits":1},"key":{"id":1},"op":"put_document"}}}
+CP → probe   {"type":"host","kind":"result","host_call_id":"h-1","outcome":{"Ok":{"ok":true}}}
 probe → CP   {"type":"result","call_id":"rp-7","outcome":{"Ok":{"n":4}}}
 ```
 

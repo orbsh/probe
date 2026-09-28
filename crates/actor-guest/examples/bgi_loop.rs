@@ -49,13 +49,25 @@ fn main() {
             // Upload-time introspection (ADR-0035: the child declares
             // its receives in its own code — the frame protocol carries
             // the same JSON schema shape every carrier's interface_schema
-            // returns).
+            // returns). The storage block is the hand-written literal,
+            // the same shape steel/nushell declare: `counters` keyed by
+            // `id`, one `count` field (ADR-0026 §4).
             ("call", "interface_schema") => reply(
                 &mut out,
                 id,
                 serde_json::json!({
-                    "receives": { "echo": {}, "ctx_round_trip": {} },
+                    "receives": { "echo": {}, "ctx_round_trip": {}, "store_round_trip": {} },
                     "wildcard_receives": [],
+                    "storage": { "collections": { "counters": { "schema": {
+                        "key_len": 8,
+                        "key_fields": [{"name": "id", "ty": "U64", "width": 8, "offset": 0, "tag": 0}],
+                        "layout_version": 1, "hot_width": 8, "payload_header_len": 3,
+                        "hot_fields": [{"name": "count", "ty": "U64", "width": 8, "offset": 0, "tag": 0}],
+                        "cold_fields": [],
+                        "slots": {"primary": 0, "dynamic": 1, "dict_id": 2, "dict_name": 3,
+                                  "declared_index_base": 4096, "declared_reduce_base": 8192,
+                                  "junction_base": 12288}
+                    }}}}
                 }),
             ),
             // Plain handler: ONE host round trip, then forward the answer.
@@ -80,6 +92,33 @@ fn main() {
                     }
                 };
                 reply(&mut out, id, answer);
+            }
+            // ctx_store_emit over the bgi seam (Phase 4.14 gate 1): the
+            // child forwards its `args` as two okm instructions — put,
+            // then read-back — and answers with what the host's store
+            // read returns. Pure transport: the child never parses the
+            // instruction, exactly the rule the wire enforces.
+            ("call", "store_round_trip") => {
+                let mut host_call = |v: &Value| {
+                    emit(&mut out, &serde_json::json!({"host": {"op": "ctx_store_emit", "args": v}}));
+                    loop {
+                        match lines.next() {
+                            Some(Ok(inner)) => {
+                                if let Ok(m) = serde_json::from_str::<Value>(inner.trim()) {
+                                    if let Some(hr) = m.get("host_reply") {
+                                        return hr.get("ok").cloned().unwrap_or(Value::Null);
+                                    }
+                                }
+                            }
+                            _ => return Value::String("no host_reply".into()),
+                        }
+                    }
+                };
+                let put = args.get("put").cloned().unwrap_or(Value::Null);
+                let get = args.get("get").cloned().unwrap_or(Value::Null);
+                host_call(&put);
+                let read_back = host_call(&get);
+                reply(&mut out, id, serde_json::json!({"read_back": read_back}));
             }
             // iterate_start: register the guard; the first round carries
             // the first item (ADR-0034: Start is also the first pull).

@@ -39,6 +39,30 @@ fn code_ref_has_no_version_field() {
 }
 
 #[test]
+fn store_emit_carries_the_instruction_as_data() {
+    // Phase 4.14 gate 1 (ADR-0026 §3 over the wire): the okm Collection
+    // instruction rides inside `op: "store_emit"` with its payload under
+    // `instruction` — the field must NOT be `op` (the discriminator
+    // collides). The probe never parses the instruction; this test is
+    // the shape lock the type system deliberately does not carry.
+    let op = probe_protocol::HostOp::StoreEmit {
+        instruction: serde_json::json!({
+            "collection": "counters", "op": "get_document", "key": {"id": 1}
+        }),
+    };
+    let s = serde_json::to_string(&op).unwrap();
+    assert!(s.starts_with(r#"{"op":"store_emit","instruction":"#), "wire shape: {s}");
+    let back: probe_protocol::HostOp = serde_json::from_str(&s).unwrap();
+    match back {
+        probe_protocol::HostOp::StoreEmit { instruction } => {
+            assert_eq!(instruction["collection"], "counters");
+            assert_eq!(instruction["op"], "get_document", "the instruction's own op token survives");
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+#[test]
 fn capability_surface_defaults_deny() {
     let c = probe_config::CapabilitySurface::default();
     assert!(c.fs_scope.is_empty());
