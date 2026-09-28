@@ -1,99 +1,71 @@
-//! Exec carrier (ADR-0035): out-of-process booths speaking the line
-//! protocol over stdin/stdout. Mode A (resident): the child is spawned
-//! once per booth instance and the frame loop lives in the child — this
-//! session is its peer, the residency IS the process. Mode B (one-shot):
-//! the same frames, the child exits at EOF — a fresh spawn per call, no
-//! ctx return path (the SKILL downgrade: invoke only).
+//! BGI + exec carriers (ADR-0035): out-of-process booths in two shapes
+//! that do NOT share a protocol — the fcgi/cgi split, named precisely.
 //!
-//! The seam mirrors the wasm carrier's discipline: JSON frames at the
-//! boundary, session state (the child process) persists across calls in
-//! mode A, eviction = close stdin + reap. The source string IS the spawn
-//! argv (the compiled booth; remote content-addressed delivery of
-//! binaries is the follow-on — recorded residual).
-//!
-//! Frame line:
+//! **bgi (Booth Gateway Interface — resident, framed)**: the child lives
+//! as long as the residency and speaks the line protocol — request
+//! frames in, result frames out, ctx round trips inline (host frames the
+//! parent answers). The author's code runs a loop: its own, or a shim
+//! the probe ships per language (the nushell fifo adapter — the
+//! "fcgi-adapts-cgi" move). Frame line:
 //!   parent → child: {"id":N,"kind":"call|iterate_start|iterate_next|iterate_dispose","event":"...","op":"start|next|dispose","args":...,"stream_id":"..."}
-//!   child → parent: {"host":{"op":"ctx_invoke","args":...}}            (mode A only: a ctx round trip)
-//!   parent → child: {"host_reply":{"ok":...}}
-//!   child → parent: {"result":...}                                      (terminates one request)
-//! One outstanding host call at a time (the script-side ctx fns are
-//! synchronous by contract — same rule as every other carrier's bridge).
+//!   child → parent: {"host":{"op":"ctx_invoke","args":...}} → parent answers {"host_reply":{"ok":...}}
+//!   child → parent: {"result":...} (terminates one request; success only — failures ride the outer Result, ADR-0012)
+//! One outstanding host call at a time (synchronous-by-contract, like
+//! every bridge). The source string IS the argv (whitespace-split — the
+//! spawn spec; remote content-addressed binaries are a recorded
+//! residual). bwrap policy wraps the spawn (mount policy before exec —
+//! the child's capability surface stays the two pipes plus the jail).
+//!
+//! **exec (bare one-shot)**: no protocol. Spawn, write the whole request
+//! as one JSON document on stdin (`{"handler": "<event>", "args":
+//! <value>}`), close, read stdout to EOF, parse it as the result value.
+//! The php-fpm lineage is exact and on purpose: nothing survives between
+//! calls — no residency, so no iterate (an error value, like Rust
+//! bodies), no ctx seam (there is no channel to hang it on), no sweep
+//! (no child can die that anyone promised to keep). This is the SKILL
+//! shape, and nushell's landing until its bgi fifo adapter ships (the
+//! user's ruling 2026-09-28): a script that reads its stdin at EOF is
+//! pure cgi — the loop never has to exist.
+//!
+//! ADR-0035's "B is A-without-a-loop" phrasing is superseded by this
+//! file's shape: B is NOT a degraded protocol — it has no protocol.
 
 use super::session::{ResidentSession, StreamOp};
 use super::HostBridge;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-/// One exec session: the spawn spec plus the current child (mode A keeps
-/// one alive; mode B replaces it per call).
-pub struct ExecSession {
-    /// The argv, kept so mode B re-spawns identically.
-    argv: Vec<String>,
-    /// Host functions for the child's ctx round trips (mode A). Named
-    /// like every other bridge's ("ctx_invoke", "ctx_iter_start", …) —
-    /// the child sends them inside a host frame.
+// --------------------------------------------------------------- bgi --
+
+/// One resident bgi session: the spawn spec plus the live framed child.
+pub struct BgiSession {
+    /// Host functions for the child's ctx round trips, named like every
+    /// other bridge's ("ctx_invoke", "ctx_iter_start", …) — the child
+    /// sends them inside a host frame.
     host: HostBridge,
-    /// The sandbox policy the child was spawned under (mode B re-applies).
-    policy: crate::sandbox::SandboxPolicy,
-    /// ADR-0035 mode B: close stdin after writing the request (EOF is
-    /// the child's cue to run — nushell slurps its args at EOF), reap
-    /// after the result, re-spawn on the next call.
-    one_shot: bool,
-    /// The live child. Mode A spawns at construction and keeps it; mode B
-    /// spawns per call and clears after (None = "spawn on next call").
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     reader: Option<BufReader<std::process::ChildStdout>>,
     next_id: u64,
 }
 
-impl ExecSession {
-    /// Mode A: spawn and keep (no sandbox).
+impl BgiSession {
+    /// Spawn and keep (no sandbox).
     pub fn spawn(argv: &[String], host: Option<&HostBridge>) -> Result<Self> {
         Self::spawn_wrapped(argv, host, &crate::sandbox::SandboxPolicy::None)
     }
 
-    /// Spawn argv[0] directly, or under the sandbox policy: a Bubblewrap
-    /// policy wraps the child in `bwrap … <argv>` via bash -c — the same
-    /// mount-namespace-before-exec shape the nushell PTY session uses
-    /// (sandbox_runtime's generator, fs allow/deny + unshared net). The
-    /// child's only capability surface stays the two pipes plus the jail.
+    /// Spawn under the sandbox policy (bwrap wraps argv, §header).
     pub fn spawn_wrapped(
         argv: &[String],
         host: Option<&HostBridge>,
         policy: &crate::sandbox::SandboxPolicy,
     ) -> Result<Self> {
-        let (child, stdin, reader) = spawn_child(argv, host, policy)?;
+        let (child, stdin, reader) = spawn_child(argv, policy)?;
         Ok(Self {
-            argv: argv.to_vec(),
             host: host.cloned().unwrap_or_default(),
-            policy: policy.clone(),
-            one_shot: false,
-            child: Some(child),
-            stdin: Some(stdin),
-            reader: Some(reader),
-            next_id: 0,
-        })
-    }
-
-    /// Mode B: the same spawn spec, one-shot semantics — a fresh process
-    /// per call, stdin closed at request write, no ctx return path.
-    /// The SKILL shape, and the landing spot for runtimes that cannot
-    /// block-read a pipe line-by-line (nushell's `input` needs a TTY;
-    /// mode A for it waits on upstream).
-    pub fn spawn_oneshot(
-        argv: &[String],
-        host: Option<&HostBridge>,
-        policy: &crate::sandbox::SandboxPolicy,
-    ) -> Result<Self> {
-        let (child, stdin, reader) = spawn_child(argv, host, policy)?;
-        Ok(Self {
-            argv: argv.to_vec(),
-            host: host.cloned().unwrap_or_default(),
-            policy: policy.clone(),
-            one_shot: true,
             child: Some(child),
             stdin: Some(stdin),
             reader: Some(reader),
@@ -103,18 +75,13 @@ impl ExecSession {
 
     /// Liveness for the registry sweep (Sessions::sweep_dead): a child
     /// that exited is a broken cache entry — evict so the next call
-    /// cold-starts a fresh spawn. Mode B is always "alive" between calls
-    /// (no child parked is its normal state, not a crash).
+    /// cold-starts.
     ///
     /// NOT `Child::try_wait`: without a reaping parent it leaves the
     /// exited child as a zombie whose pid never resolves, so a crashed
-    /// mode-A child would read alive forever. WNOHANG waitpid reaps
-    /// directly — 0 still-alive, negative ESRCH (already reaped), other
-    /// = exited.
+    /// child would read alive forever. WNOHANG waitpid reaps directly —
+    /// 0 still-alive, negative ESRCH (already reaped), other = exited.
     pub fn is_alive(&mut self) -> bool {
-        if self.one_shot {
-            return true;
-        }
         match self.child.as_mut() {
             None => false,
             Some(child) => {
@@ -131,103 +98,73 @@ impl ExecSession {
         self.child.as_ref().map(|c| c.id())
     }
 
-    /// Ensure a live child for the next exchange. Mode A never needs it
-    /// after construction (the child is resident); mode B calls this when
-    /// the previous one-shot was reaped and cleared.
-    fn ensure_child(&mut self) -> Result<()> {
-        if self.child.is_some() {
-            return Ok(());
-        }
-        let (child, stdin, reader) =
-            spawn_child(&self.argv, Some(&self.host), &self.policy)?;
-        self.child = Some(child);
-        self.stdin = Some(stdin);
-        self.reader = Some(reader);
-        Ok(())
-    }
-
     /// One request frame in, one result out, servicing host frames in
     /// between (the child blocks on its ctx call; we answer and keep
-    /// reading until the result arrives). Mode B writes the request,
-    /// CLOSES stdin (the EOF is the child's cue — its args arrive with
-    /// it), then reads the single result; a host frame from a one-shot
-    /// child is a contract violation (B is ctx-free, ADR-0035 §2).
+    /// reading until the result arrives).
     fn exchange(&mut self, mut frame: Value) -> Result<Value> {
-        self.ensure_child()?;
         let id = self.next_id;
         self.next_id += 1;
         frame["id"] = Value::from(id);
         {
-            let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("exec carrier: stdin closed"))?;
-            writeln!(stdin, "{frame}").map_err(|e| anyhow!("exec carrier: write request: {e}"))?;
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("bgi carrier: stdin closed"))?;
+            writeln!(stdin, "{frame}")
+                .map_err(|e| anyhow!("bgi carrier: write request: {e}"))?;
             stdin.flush()?;
-        }
-        if self.one_shot {
-            // EOF triggers the child to run; there is no return path.
-            self.stdin = None;
         }
         loop {
             let mut line = String::new();
             let reader = self
                 .reader
                 .as_mut()
-                .ok_or_else(|| anyhow!("exec carrier: no stdout"))?;
-            let n = reader.read_line(&mut line).map_err(|e| anyhow!("exec carrier: read: {e}"))?;
+                .ok_or_else(|| anyhow!("bgi carrier: no stdout"))?;
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| anyhow!("bgi carrier: read: {e}"))?;
             if n == 0 {
-                // Child closed stdout (exited after its answer — mode B's
-                // normal end — or crashed mid-call in mode A).
-                self.teardown_child();
-                return Err(anyhow!("exec carrier: child closed stdout (exited or crashed)"));
+                self.teardown();
+                return Err(anyhow!("bgi carrier: child closed stdout (exited or crashed)"));
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let msg: Value = serde_json::from_str(trimmed)
-                .map_err(|e| anyhow!("exec carrier: malformed frame {trimmed}: {e}"))?;
+                .map_err(|e| anyhow!("bgi carrier: malformed frame {trimmed}: {e}"))?;
             if let Some(host) = msg.get("host") {
-                if self.stdin.is_none() {
-                    anyhow::bail!(
-                        "exec carrier mode B: child sent a host frame ('{}') but B is ctx-free \
-                         (one-shot scripts answer and exit; no stdin return path)",
-                        host.get("op").and_then(|v| v.as_str()).unwrap_or("?")
-                    );
-                }
                 // One ctx round trip: run the named host fn, answer on
                 // stdin. Unknown op = an error value back into the child.
                 let op = host.get("op").and_then(|v| v.as_str()).unwrap_or_default();
                 let args = host.get("args").cloned().unwrap_or(Value::Null);
                 let outcome = match self.host.functions.get(op) {
                     Some(f) => (f)(args),
-                    None => Err(anyhow!("exec carrier: unknown host op '{op}'")),
+                    None => Err(anyhow!("bgi carrier: unknown host op '{op}'")),
                 };
                 let reply = match outcome {
                     Ok(v) => serde_json::json!({"host_reply": {"ok": v}}),
                     Err(e) => serde_json::json!({"host_reply": {"error": e.to_string()}}),
                 };
-                let stdin = self.stdin.as_mut().unwrap();
-                writeln!(stdin, "{reply}").map_err(|e| anyhow!("exec carrier: write host_reply: {e}"))?;
+                let stdin = self
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("bgi carrier: stdin closed"))?;
+                writeln!(stdin, "{reply}")
+                    .map_err(|e| anyhow!("bgi carrier: write host_reply: {e}"))?;
                 stdin.flush()?;
                 continue;
             }
             if let Some(result) = msg.get("result") {
-                let result = result.clone();
-                if self.one_shot {
-                    // B's contract: the answer is the last word — reap now
-                    // (a lingering child is killed) and clear; the next
-                    // call re-spawns.
-                    self.teardown_child();
-                }
-                return Ok(result);
+                return Ok(result.clone());
             }
-            return Err(anyhow!("exec carrier: unexpected frame {msg}"));
+            return Err(anyhow!("bgi carrier: unexpected frame {msg}"));
         }
     }
 
-    /// End the current child: drop stdin (the loop's EOF), reap with a
-    /// kill guard. Shared by mode B's per-call teardown and Drop.
-    fn teardown_child(&mut self) {
-        self.stdin = None; // EOF for a well-behaved loop
+    /// End the child: drop stdin (the loop's EOF), reap with a kill guard.
+    fn teardown(&mut self) {
+        self.stdin = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -236,17 +173,157 @@ impl ExecSession {
     }
 }
 
-/// Fork/exec argv[0] (or the bwrap wrapper) with piped stdio. Separated
-/// so mode A's construction and mode B's per-call re-spawn share it.
+impl ResidentSession for BgiSession {
+    /// The source was consumed by spawn (the argv); the child's module
+    /// state is its own.
+    fn load(&mut self, _source: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn call(&mut self, handler: &str, args: &Value) -> Result<Value> {
+        self.exchange(serde_json::json!({
+            "kind": "call", "event": handler, "args": args,
+        }))
+    }
+
+    /// ADR-0034 over the bgi seam: the stream verbs are request frames —
+    /// the child keeps whatever guard state or generator its language
+    /// offers, the envelope rule is the ADR's, unchanged.
+    fn iterate(&mut self, op: StreamOp) -> Result<Value> {
+        let (kind, event, op_tag, args, stream_id) = match &op {
+            StreamOp::Start { stream_id, handler, args } => {
+                ("iterate_start", handler, "start", args, stream_id)
+            }
+            StreamOp::Next { stream_id, handler, args } => {
+                ("iterate_next", handler, "next", args, stream_id)
+            }
+            StreamOp::Dispose { stream_id, handler, args } => {
+                ("iterate_dispose", handler, "dispose", args, stream_id)
+            }
+        };
+        self.exchange(serde_json::json!({
+            "kind": kind, "event": event, "op": op_tag,
+            "args": args, "stream_id": stream_id,
+        }))
+    }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl Drop for BgiSession {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+// -------------------------------------------------------------- exec --
+
+/// The bare one-shot carrier: NO ResidentSession, NO protocol — the cgi
+/// shape. Spawn, feed the whole request as one JSON document on stdin,
+/// close, read stdout to EOF as the result. Nothing survives the call
+/// (php-fpm semantics, on purpose: the SKILL downgrade and nushell's
+/// landing until its bgi adapter ships).
+pub struct ExecOneShot {
+    argv: Vec<String>,
+    policy: crate::sandbox::SandboxPolicy,
+}
+
+impl ExecOneShot {
+    pub fn new(argv: &[String], policy: &crate::sandbox::SandboxPolicy) -> Self {
+        Self { argv: argv.to_vec(), policy: policy.clone() }
+    }
+    /// One invocation = one process = one JSON in, one JSON out.
+    pub fn run(&self, handler: &str, args: &Value) -> Result<Value> {
+        let (mut child, stdin, mut stdout) = spawn_child(&self.argv, &self.policy)?;
+        let request = serde_json::json!({ "handler": handler, "args": args });
+        // Write the whole request, then CLOSE — EOF is the script's cue
+        // to run (and nushell's `open /dev/stdin` shape needs exactly
+        // this: it delivers at writer-EOF).
+        {
+            let mut stdin = stdin;
+            stdin
+                .write_all(request.to_string().as_bytes())
+                .map_err(|e| anyhow!("exec carrier: write request: {e}"))?;
+            stdin.flush()?;
+        } // stdin drops here: the writer closes, the child sees EOF.
+        let mut out = String::new();
+        stdout
+            .read_to_string(&mut out)
+            .map_err(|e| anyhow!("exec carrier: read stdout: {e}"))?;
+        let status = child
+            .wait()
+            .map_err(|e| anyhow!("exec carrier: wait: {e}"))?;
+        let trimmed = out.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!(
+                "exec carrier: empty stdout (exit {:?}) — a one-shot script must print its result JSON",
+                status.code()
+            );
+        }
+        serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!("exec carrier: stdout is not one JSON document: {e}"))
+    }
+}
+
+/// The session-seam wrapper so the dispatch machinery (aura run_job, the
+/// remote carrier path, the introspection throwaway) keeps ONE shape:
+/// this parks no process between calls — every `call` spawns, feeds,
+/// reaps. `iterate` is an error value on principle: a one-shot booth has
+/// no residency to hold a stream (same ruling as Rust closure bodies,
+/// ADR-0034 — the cgi lineage is stateless by definition, not by
+/// omission). Sweep ignores these slots (not a BgiSession: nothing can
+/// die that was never promised to live).
+pub struct OneShotSession {
+    inner: ExecOneShot,
+}
+
+impl OneShotSession {
+    pub fn new(argv: &[String], policy: &crate::sandbox::SandboxPolicy) -> Self {
+        Self { inner: ExecOneShot::new(argv, policy) }
+    }
+}
+
+impl ResidentSession for OneShotSession {
+    /// Nothing to load — the spawn spec is the whole program.
+    fn load(&mut self, _source: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn call(&mut self, handler: &str, args: &Value) -> Result<Value> {
+        self.inner.run(handler, args)
+    }
+
+    fn iterate(&mut self, _op: StreamOp) -> Result<Value> {
+        Err(anyhow!(
+            "exec carrier: one-shot booths carry no stream state (ADR-0035 — \
+             the cgi shape is stateless by definition; use bgi for residency) \
+             — no stream is started"
+        ))
+    }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+// -------------------------------------------------------------- spawn --
+
+/// Fork/exec argv[0] (or the bwrap wrapper) with piped stdio; stderr is
+/// inherited (the child's diagnostics reach the probe's log, never the
+/// result channel).
 fn spawn_child(
     argv: &[String],
-    host: Option<&HostBridge>,
     policy: &crate::sandbox::SandboxPolicy,
-) -> Result<(Child, ChildStdin, BufReader<std::process::ChildStdout>)> {
-    let _ = host; // the bridge rides the parent's exchange loop, not the child's env
+) -> Result<(
+    Child,
+    ChildStdin,
+    BufReader<std::process::ChildStdout>,
+)> {
     let (head, rest) = argv
         .split_first()
-        .ok_or_else(|| anyhow!("exec carrier: empty spawn spec"))?;
+        .ok_or_else(|| anyhow!("exec/bgi carrier: empty spawn spec"))?;
     let mut cmd = match policy {
         crate::sandbox::SandboxPolicy::None => {
             let mut c = Command::new(head);
@@ -277,7 +354,7 @@ fn spawn_child(
                 0,
                 Some("/bin/bash"),
             )
-            .map_err(|e| anyhow!("exec carrier: bwrap command: {e}"))?;
+            .map_err(|e| anyhow!("exec/bgi carrier: bwrap command: {e}"))?;
             let mut c = Command::new("bash");
             c.arg("-c").arg(wrapped);
             c
@@ -288,56 +365,14 @@ fn spawn_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| anyhow!("exec carrier: spawn {head}: {e}"))?;
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("exec carrier: no stdin"))?;
+        .map_err(|e| anyhow!("exec/bgi carrier: spawn {head}: {e}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("exec/bgi carrier: no stdin"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow!("exec carrier: no stdout"))?;
+        .ok_or_else(|| anyhow!("exec/bgi carrier: no stdout"))?;
     Ok((child, stdin, BufReader::new(stdout)))
-}
-
-impl ResidentSession for ExecSession {
-    /// The source was consumed by spawn (the argv). Loading is the
-    /// carrier's construction — the child's module state is its own.
-    fn load(&mut self, _source: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn call(&mut self, handler: &str, args: &Value) -> Result<Value> {
-        self.exchange(serde_json::json!({
-            "kind": "call", "event": handler, "args": args,
-        }))
-    }
-
-    /// ADR-0034 over the exec seam: the stream verbs are request frames
-    /// (the child keeps whatever guard state or generator its language
-    /// offers; the envelope rule is the ADR's, unchanged).
-    fn iterate(&mut self, op: StreamOp) -> Result<Value> {
-        let (kind, event, op_tag, args, stream_id) = match &op {
-            StreamOp::Start { stream_id, handler, args } => {
-                ("iterate_start", handler, "start", args, stream_id)
-            }
-            StreamOp::Next { stream_id, handler, args } => {
-                ("iterate_next", handler, "next", args, stream_id)
-            }
-            StreamOp::Dispose { stream_id, handler, args } => {
-                ("iterate_dispose", handler, "dispose", args, stream_id)
-            }
-        };
-        self.exchange(serde_json::json!({
-            "kind": kind, "event": event, "op": op_tag,
-            "args": args, "stream_id": stream_id,
-        }))
-    }
-
-    fn as_any(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-}
-
-impl Drop for ExecSession {
-    fn drop(&mut self) {
-        self.teardown_child();
-    }
 }

@@ -1,24 +1,32 @@
-//! Exec carrier tests (ADR-0035 mode A): the line protocol over real
-//! pipes against the `exec_loop` fixture binary — call, ctx round trip
-//! over the host bridge, the iterate verbs, and the residency rules
-//! (the child IS the residency: eviction closes stdin + reaps; a dead
-//! child is swept from the registry so the next call cold-starts).
+//! Exec/BGI carrier tests (ADR-0035): the framed resident shape (bgi —
+//! the `bgi_loop` fixture: the line protocol, call, ctx round trip, the
+//! iterate verbs, residency/sweep rules) and the bare one-shot shape
+//! (exec — the `one_shot` fixture: no protocol, one JSON in, one JSON
+//! out, nothing survives the call).
 //!
-//! The fixture is built by the workspace (`cargo build -p actor-guest
-//! --example exec_loop`); a missing binary fails the test loudly — a
-//! stale build is a recipe error, never a skip.
+//! Fixtures are built by the workspace (`cargo build -p actor-guest
+//! --examples`); a missing binary fails the test loudly — a stale build
+//! is a recipe error, never a skip.
 
 use probe_runtime::carrier::session::StreamOp;
 use probe_runtime::carrier::HostBridge;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-fn exec_bin() -> String {
+fn bgi_bin() -> String {
+    bin("bgi_loop")
+}
+
+fn one_shot_bin() -> String {
+    bin("one_shot")
+}
+
+fn bin(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/examples/exec_loop");
+        .join(format!("../../target/debug/examples/{name}"));
     assert!(
         path.exists(),
-        "exec_loop missing — build it: cargo build -p actor-guest --example exec_loop"
+        "{name} missing — build it: cargo build -p actor-guest --examples"
     );
     path.to_str().unwrap().to_string()
 }
@@ -30,13 +38,13 @@ fn sessions() -> probe_runtime::carrier::session::Sessions {
 /// Plain call through the resident session: request frame out, result
 /// frame back — the invoke shape across the process boundary.
 #[test]
-fn exec_call_round_trip() {
+fn bgi_call_round_trip() {
     let s = sessions();
-    let argv = exec_bin();
+    let argv = bgi_bin();
     let out = s
         .with_session(
             "box/k1",
-            "exec",
+            "bgi",
             &argv,
             None,
             &probe_runtime::sandbox::SandboxPolicy::None,
@@ -51,7 +59,7 @@ fn exec_call_round_trip() {
     let out2 = s
         .with_session(
             "box/k1",
-            "exec",
+            "bgi",
             &argv,
             None,
             &probe_runtime::sandbox::SandboxPolicy::None,
@@ -66,7 +74,7 @@ fn exec_call_round_trip() {
 /// child forwards the reply into its result. This is ADR-0035's §3
 /// `host` / `host_reply` pair over real pipes.
 #[test]
-fn exec_host_call_crosses_the_seam() {
+fn bgi_host_call_crosses_the_seam() {
     let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let bridge = {
         let seen = seen.clone();
@@ -81,11 +89,11 @@ fn exec_host_call_crosses_the_seam() {
         b
     };
     let s = sessions();
-    let argv = exec_bin();
+    let argv = bgi_bin();
     let out = s
         .with_session(
             "box/k2",
-            "exec",
+            "bgi",
             &argv,
             Some(&bridge),
             &probe_runtime::sandbox::SandboxPolicy::None,
@@ -104,21 +112,21 @@ fn exec_host_call_crosses_the_seam() {
     );
 }
 
-/// ADR-0034 over the exec seam: start carries the first envelope,
+/// ADR-0034 over the bgi seam: start carries the first envelope,
 /// next advances the guard the CHILD keeps in its own memory (the
-/// residency is the stream state — mode A's envelope producer has no
+/// residency is the stream state — the envelope producer has no
 /// generator, and it does not need one), done is written.
 #[test]
-fn exec_iterate_stream() {
+fn bgi_iterate_stream() {
     let s = sessions();
-    let argv = exec_bin();
+    let argv = bgi_bin();
     // One with_session per pull — each call re-enters the SAME child
     // (the registry keys residency; the guard state lives in the
     // child's memory across the calls, exactly like a session VM).
     let pull = |op: StreamOp| -> Value {
         s.with_session(
             "box/k3",
-            "exec",
+            "bgi",
             &argv,
             None,
             &probe_runtime::sandbox::SandboxPolicy::None,
@@ -153,7 +161,7 @@ fn exec_iterate_stream() {
     let late = s
         .with_session(
             "box/k3",
-            "exec",
+            "bgi",
             &argv,
             None,
             &probe_runtime::sandbox::SandboxPolicy::None,
@@ -169,20 +177,19 @@ fn exec_iterate_stream() {
     assert!(late.get("error").is_some(), "unknown stream is an error value, got {late}");
 }
 
-/// ADR-0035 mode B (the SKILL shape): one process per call. The same
-/// exec_loop binary serves — the parent closes stdin right after the
-/// request (EOF is the child's cue, which is exactly how nushell reads
-/// its args), the child answers and its loop ends. Two calls = two
-/// processes: nothing survives between them (guard state included —
-/// the residency is gone with the process, invoke-only semantics).
+/// exec (the bare cgi shape): one process per call, NO protocol — the
+/// request is one JSON document on stdin (closed = the child's cue),
+/// the result is stdout whole. Two calls = two processes; nothing
+/// survives between them (the `count` handler counts what THIS call's
+/// args say — a guard counter could not exist).
 #[test]
 fn exec_oneshot_runs_per_call() {
     let s = sessions();
-    let argv = exec_bin();
+    let argv = one_shot_bin();
     let call = |v: Value| {
         s.with_session(
             "box/b1",
-            "exec-b",
+            "exec",
             &argv,
             None,
             &probe_runtime::sandbox::SandboxPolicy::None,
@@ -193,50 +200,47 @@ fn exec_oneshot_runs_per_call() {
     assert_eq!(call(json!({"n": 1})), json!({"echoed": {"n": 1}}));
     assert_eq!(call(json!({"n": 2})), json!({"echoed": {"n": 2}}));
 
-    // No residency to sweep: mode B's slot parks no live child between
-    // calls (is_alive is true by contract — an absent child is normal).
-    assert!(s.sweep_dead().is_empty(), "B's parked slots are never 'dead'");
+    // No residency to sweep: a one-shot slot never parks a child.
+    assert!(s.sweep_dead().is_empty(), "one-shot slots are never 'dead'");
 }
 
-/// Mode B's ctx rule as an ASSERTION, not a surprise: a one-shot child
-/// that sends a host frame hits the contract violation (B is ctx-free —
-/// the established invoke-only downgrade; the error value names the
-/// design, the fix is mode A).
+/// The statelessness is asserted, not assumed: iterate on a one-shot
+/// booth is an error value that NAMES the design (the cgi lineage has
+/// no residency to hold a stream — the fix is bgi, not a retry).
 #[test]
-fn exec_oneshot_rejects_host_frames() {
+fn exec_oneshot_iterate_is_a_named_error() {
     let s = sessions();
-    let argv = exec_bin();
-    let mut bridge = HostBridge::default();
-    bridge.functions.insert(
-        "ctx_invoke".into(),
-        Arc::new(|arg: Value| Ok(json!({"answered": arg}))) as probe_runtime::carrier::HostFn,
-    );
+    let argv = one_shot_bin();
     let r = s.with_session(
         "box/b2",
-        "exec-b",
+        "exec",
         &argv,
-        Some(&bridge),
+        None,
         &probe_runtime::sandbox::SandboxPolicy::None,
         |sess| {
-            sess.call(
-                "ctx_round_trip",
-                &json!({"type": "t", "key": "k", "handler": "h", "args": {}}),
-            )
+            sess.iterate(StreamOp::Start {
+                stream_id: "s1".into(),
+                handler: "count".into(),
+                args: json!({"total": 2}),
+            })
         },
     );
     let err = r.unwrap_err().to_string();
-    assert!(err.contains("ctx-free"), "mode B names the contract violation: {err}");
+    assert!(
+        err.contains("stateless by definition") && err.contains("bgi"),
+        "one-shot iterate names the design: {err}"
+    );
 }
 
-/// Mode A residency rule: eviction closes stdin (the loop's EOF) and
+/// BGI residency rule: eviction closes stdin (the loop's EOF) and
 /// reaps; a child that died on its own is swept by sweep_dead so the
 /// next call cold-starts a fresh spawn.
 #[test]
 fn eviction_ends_the_residency_and_sweep_clears_the_dead() {
     let s = sessions();
-    let argv = exec_bin();
+    let argv = bgi_bin();
     // Spawn + one call.
-    s.with_session("box/k4", "exec", &argv, None, &probe_runtime::sandbox::SandboxPolicy::None, |sess| {
+    s.with_session("box/k4", "bgi", &argv, None, &probe_runtime::sandbox::SandboxPolicy::None, |sess| {
         sess.call("echo", &json!(1))
     })
     .unwrap();
@@ -246,15 +250,15 @@ fn eviction_ends_the_residency_and_sweep_clears_the_dead() {
     let pid = s
         .with_session(
             "box/k4",
-            "exec",
+            "bgi",
             &argv,
             None,
             &probe_runtime::sandbox::SandboxPolicy::None,
             |sess| {
                 sess.as_any()
-                    .downcast_mut::<probe_runtime::carrier::exec::ExecSession>()
-                    .map(|e| serde_json::json!({ "pid": e.child_pid() }))
-                    .ok_or_else(|| anyhow::anyhow!("not an exec session"))
+                    .downcast_mut::<probe_runtime::carrier::exec::BgiSession>()
+                    .and_then(|e| e.child_pid().map(|p| json!({ "pid": p })))
+                    .ok_or_else(|| anyhow::anyhow!("not a bgi session"))
             },
         )
         .unwrap()["pid"]
@@ -274,7 +278,7 @@ fn eviction_ends_the_residency_and_sweep_clears_the_dead() {
     }
     assert!(swept.contains(&"box/k4".to_string()), "the dead slot is swept: {swept:?}");
     let out = s
-        .with_session("box/k4", "exec", &argv, None, &probe_runtime::sandbox::SandboxPolicy::None, |sess| {
+        .with_session("box/k4", "bgi", &argv, None, &probe_runtime::sandbox::SandboxPolicy::None, |sess| {
             sess.call("echo", &json!("after respawn"))
         })
         .unwrap();

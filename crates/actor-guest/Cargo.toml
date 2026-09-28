@@ -23,7 +23,11 @@ name = "stream_puller"
 crate-type = ["cdylib"]
 
 [[example]]
-name = "exec_loop"
+name = "bgi_loop"
+crate-type = ["bin"]
+
+[[example]]
+name = "one_shot"
 crate-type = ["bin"]
 
 [lints.rust]

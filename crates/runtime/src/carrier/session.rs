@@ -191,7 +191,7 @@ impl Sessions {
                     .and_then(|mut s| {
                         let dead = s
                             .as_any()
-                            .downcast_mut::<crate::carrier::exec::ExecSession>()
+                            .downcast_mut::<crate::carrier::exec::BgiSession>()
                             .map(|e| !e.is_alive())
                             .unwrap_or(false);
                         dead.then(|| k.clone())
@@ -232,22 +232,26 @@ fn spawn_session(
             sandbox,
             host.map(|h| std::sync::Arc::new(h.clone())),
         )?),
-        // Exec (ADR-0035): the source string IS the argv (whitespace-
-        // separated, quoted-free — the spawn spec). Mode A: the child
-        // lives as long as the session; its argv[0] must speak the line
-        // protocol. Under a sandbox policy the whole spawn is bwrap-
-        // wrapped (the nushell PTY precedent — mount policy before exec).
+        // BGI (ADR-0035, Booth Gateway Interface — the framed resident
+        // shape): the source string IS the argv (whitespace-separated,
+        // quoted-free — the spawn spec); the child lives as long as the
+        // session and runs the BGI loop over the line protocol. Under a
+        // sandbox policy the whole spawn is bwrap-wrapped (the nushell
+        // PTY precedent — mount policy before exec).
+        "bgi" => {
+            let argv: Vec<String> = shellish_split(source);
+            Box::new(super::exec::BgiSession::spawn_wrapped(&argv, host, sandbox)?)
+        }
+        // exec (ADR-0035 — the bare cgi shape, NO protocol): one process
+        // per call — the request JSON is written, stdin closed (EOF is
+        // the script's cue; nushell's `open /dev/stdin` needs exactly
+        // this), stdout read whole as the result. Nothing survives the
+        // call: iterate is an error value, no ctx channel exists, no
+        // residency to sweep. The SKILL shape and nushell's landing
+        // until its bgi fifo adapter ships (user ruling 2026-09-28).
         "exec" => {
             let argv: Vec<String> = shellish_split(source);
-            Box::new(super::exec::ExecSession::spawn_wrapped(&argv, host, sandbox)?)
-        }
-        // Mode B (ADR-0035 §2, the SKILL shape): one process per call,
-        // stdin closed at the request (EOF is the child's cue — nushell
-        // and other no-block-read-pipe runtimes land here; the ctx seam
-        // has no return path in B, matching the invoke-only downgrade).
-        "exec-b" => {
-            let argv: Vec<String> = shellish_split(source);
-            Box::new(super::exec::ExecSession::spawn_oneshot(&argv, host, sandbox)?)
+            Box::new(super::exec::OneShotSession::new(&argv, sandbox))
         }
         // Wasm compiles AT SPAWN (from_source) — its `load` is a no-op;
         // other carriers load lazily inside `load`. Same session shape.

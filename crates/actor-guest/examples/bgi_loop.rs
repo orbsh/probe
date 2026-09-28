@@ -1,7 +1,8 @@
-//! Exec carrier fixture (ADR-0035): a native bin speaking the line
-//! protocol — the contract a compiled Rust booth implements against.
-//! Mode A: loop over stdin lines until EOF; one request in, one result
-//! out. `ctx_round_trip` answers a plain call with a child→parent ctx
+//! BGI carrier fixture (ADR-0035): a native bin speaking the line
+//! protocol — the contract a compiled Rust booth implements against
+//! (or links a shim to; the loop lives on the child side in bgi).
+//! Loop over stdin lines until EOF; one request in, one result out.
+//! `ctx_round_trip` answers a plain call with a child→parent ctx
 //! round trip (host frame → host_reply → result), proving the ctx seam
 //! crosses the process boundary. Iterate handlers return envelopes per
 //! ADR-0034 with the guard counter in this process's memory (the
