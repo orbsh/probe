@@ -18,5 +18,9 @@ ciborium = "0.2"
 name = "counter_actor"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "stream_puller"
+crate-type = ["cdylib"]
+
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
