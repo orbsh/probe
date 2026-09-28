@@ -18,11 +18,102 @@ pub trait ResidentSession: Send {
     fn load(&mut self, source: &str) -> Result<()>;
     /// Invoke one handler by name with parsed JSON args.
     fn call(&mut self, handler: &str, args: &Value) -> Result<Value>;
+    /// Drive one stream op (ADR-0034). Envelope-mode carriers (steel,
+    /// nushell, wasm — languages without a host-drivable generator
+    /// protocol; a Rust wasm guest maps its own `Iterator` inside the
+    /// module and returns the envelope at the ABI edge) delegate to
+    /// `envelope_pull`; carriers with a native generator the host can
+    /// park and step (python) override and never let the handler see
+    /// the wire shape.
+    fn iterate(&mut self, op: StreamOp) -> Result<Value>;
     /// Downcast support (carrier-specific introspection, e.g. wasm's
     /// export-list derivation).
     fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
 
+/// One stream verb from the control plane to a resident session
+/// (ADR-0034). Every op carries the handler name + args: envelope-mode
+/// sessions are stateless per call (the handler keeps its own guard
+/// state in module globals), and generator-mode sessions use
+/// `stream_id` only as the map key — the registry of live streams lives
+/// in the control plane either way.
+#[derive(Debug, Clone)]
+pub enum StreamOp {
+    Start { stream_id: String, handler: String, args: Value },
+    Next { stream_id: String, handler: String, args: Value },
+    Dispose { stream_id: String, handler: String, args: Value },
+}
+
+impl StreamOp {
+    pub fn stream_id(&self) -> &str {
+        match self {
+            StreamOp::Start { stream_id, .. }
+            | StreamOp::Next { stream_id, .. }
+            | StreamOp::Dispose { stream_id, .. } => stream_id,
+        }
+    }
+    pub fn handler(&self) -> &str {
+        match self {
+            StreamOp::Start { handler, .. }
+            | StreamOp::Next { handler, .. }
+            | StreamOp::Dispose { handler, .. } => handler,
+        }
+    }
+    pub fn args(&self) -> &Value {
+        match self {
+            StreamOp::Start { args, .. }
+            | StreamOp::Next { args, .. }
+            | StreamOp::Dispose { args, .. } => args,
+        }
+    }
+    /// The op tag injected into the handler args (envelope mode).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            StreamOp::Start { .. } => "start",
+            StreamOp::Next { .. } => "next",
+            StreamOp::Dispose { .. } => "dispose",
+        }
+    }
+}
+
+/// The envelope-mode iteration shape (ADR-0034 §1, languages without a
+/// host-drivable generator protocol — steel, nushell, wasm): the handler
+/// is a repeatedly callable function that returns the envelope
+/// explicitly. The framework injects `{stream_id, op}` into the args,
+/// forwards the call, and validates that the reply carries a boolean
+/// `done` field. `done: true` is WRITTEN, not derived — the validation
+/// narrows the guard-value footgun, it does not eliminate it.
+pub(crate) fn envelope_pull(session: &mut dyn ResidentSession, op: &StreamOp) -> Result<Value> {
+    let mut args = op.args().clone();
+    let inject = serde_json::json!({
+        "stream_id": op.stream_id(),
+        "op": op.tag(),
+    });
+    match &mut args {
+        Value::Object(map) => {
+            map.insert("iterate".into(), inject);
+        }
+        Value::Null => {
+            args = Value::Object([("iterate".to_string(), inject)].into_iter().collect());
+        }
+        other => anyhow::bail!("iterate: handler args must be an object, got {other}"),
+    }
+    let envelope = session.call(op.handler(), &args)?;
+    if matches!(op, StreamOp::Dispose { .. }) {
+        return Ok(Value::Null);
+    }
+    let done = envelope
+        .get("done")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| anyhow::anyhow!(
+            "iterate: envelope handler '{}' must return an object with a boolean `done` field (ADR-0034)",
+            op.handler()
+        ))?;
+    if done && envelope.get("item").is_some() {
+        anyhow::bail!("iterate: envelope with `done: true` must not carry an `item`");
+    }
+    Ok(envelope)
+}
 /// Per-instance slot: the session plus its own lock. The lock is held only
 /// for the duration of one call on THAT instance — other instances proceed
 /// concurrently, and host functions that call back into other instances

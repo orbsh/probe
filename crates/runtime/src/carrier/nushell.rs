@@ -124,6 +124,15 @@ impl ResidentSession for NushellResident {
         self.session.call(handler, args)
     }
 
+    /// ADR-0034 envelope mode (same shape as steel): the nu handler is a
+    /// repeatedly callable `def` that returns `{item, done}` explicitly;
+    /// guard state rides `$env` (handlers touching it are `def --env`).
+    /// Dispose forwards one `op: "dispose"` call so the handler can
+    /// clear its guard, then drops the envelope check.
+    fn iterate(&mut self, op: super::session::StreamOp) -> Result<Value> {
+        super::session::envelope_pull(self, &op)
+    }
+
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }

@@ -213,6 +213,16 @@ impl ResidentSession for WasmSession {
         Ok(ciborium::from_reader(&out[..])?)
     }
 
+    /// ADR-0034 envelope mode over the existing ABI: the export is an
+    /// ordinary `(ptr,len)->i64` handler called through `call` with args
+    /// carrying `{iterate: {stream_id, op}}`; a Rust guest parks its own
+    /// `Iterator` in module state and projects exhaustion into the
+    /// explicit `done: true` envelope at the ABI edge. No new import or
+    /// memory shape — the envelope is CBOR-encodable schema.
+    fn iterate(&mut self, op: super::session::StreamOp) -> Result<Value> {
+        super::session::envelope_pull(self, &op)
+    }
+
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }

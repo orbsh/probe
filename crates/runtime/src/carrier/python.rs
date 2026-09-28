@@ -1,6 +1,8 @@
 //! Python carrier (PyO3, in-process CPython, zero IPC).
 
+use super::session::StreamOp;
 use super::{ExecResult, HostBridge, HostFn};
+use std::collections::HashMap;
 use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
@@ -62,6 +64,47 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
         Some(&globals),
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("okm schema DSL: {e}")))?;
+
+    // ADR-0034 consumer wrapper: `ctx_iterate` turns the three host fns
+    // (ctx_iter_start/next/dispose, bound right after the module is
+    // loaded when a bridge exists) into ONE native generator. The
+    // consumer writes `for tok in ctx_iterate(...)`: the first envelope
+    // arrives with the Start round trip (stream_id merged by the realm),
+    // `done: true` ends the loop (StopIteration — structural, not a
+    // sentinel), and abandoning mid-loop raises GeneratorExit into this
+    // frame, whose `finally` sends dispose. Args marshal as JSON strings
+    // — the PyCFunction seam extracts String (same contract the other
+    // ctx host fns use).
+    let globals = module.dict();
+    py.run(
+        CString::new(
+            r#"
+import json as _aura_json
+
+def ctx_iterate(booth_type, booth_key, handler, args=None):
+    first = ctx_iter_start(_aura_json.dumps({
+        "type": booth_type, "key": booth_key,
+        "handler": handler, "args": args if args is not None else {},
+    }))
+    stream_id = first["stream_id"]
+    env = first
+    try:
+        while not env.get("done"):
+            yield env["item"]
+            env = ctx_iter_next(_aura_json.dumps({"stream_id": stream_id}))
+    finally:
+        # Mid-stream abandonment (break / GeneratorExit / error before
+        # done): dispose is the mandatory dual. Idempotent realm-side —
+        # a stream already ended or failed answers success.
+        if not env.get("done"):
+            ctx_iter_dispose(_aura_json.dumps({"stream_id": stream_id}))
+"#,
+        )?
+        .as_c_str(),
+        Some(&globals),
+        Some(&globals),
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("iterate prelude: {e}")))?;
 
     // Execute the module body with the module dict as globals so the
     // decorators resolve `on` (bound above, before the body runs).
@@ -151,6 +194,13 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
 pub struct PythonSession {
     module: Option<Py<PyModule>>,
     host: Option<HostBridge>,
+    /// Live iterate streams (ADR-0034 generator mode): the framework
+    /// drives the native generator; the handler never sees the wire
+    /// protocol. stream_id -> the generator object (GIL held whenever
+    /// this is touched — the session already lives under one slot lock).
+    /// `unsafe impl Send` below covers the whole session; streams die
+    /// with it (eviction = failed stream, per the ADR).
+    streams: HashMap<String, Py<PyAny>>,
 }
 
 // Py<PyModule> is not Send; sessions live on one runtime thread each, so
@@ -159,7 +209,7 @@ unsafe impl Send for PythonSession {}
 
 impl PythonSession {
     pub fn new(host: Option<&HostBridge>) -> anyhow::Result<Self> {
-        Ok(Self { module: None, host: host.cloned() })
+        Ok(Self { module: None, host: host.cloned(), streams: HashMap::new() })
     }
 }
 
@@ -178,7 +228,18 @@ impl super::session::ResidentSession for PythonSession {
                         let raw: String = args.get_item(0)?.extract()?;
                         let decoded: Value = serde_json::from_str(&raw)
                             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("host arg not JSON: {e}")))?;
-                        let out = (f)(decoded)
+                        // Release the GIL around the host call: ctx fns
+                        // block_on an async round trip that may run ANOTHER
+                        // python booth's session (iterate, invoke) — that
+                        // session needs the GIL. Holding it across the
+                        // block is a guaranteed deadlock; allow_threads is
+                        // the pyo3 contract for exactly this (ADR-0034 e2e
+                        // caught it; the same shape applies to ctx_invoke
+                        // between two python booths).
+                        let out = {
+                            let f = f.clone();
+                            py.allow_threads(move || (f)(decoded))
+                        }
                             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
                         Ok::<_, pyo3::PyErr>(json_to_py(py, &out)?.unbind())
                     })?;
@@ -207,6 +268,101 @@ impl super::session::ResidentSession for PythonSession {
                 .call1((args_py,))
                 .map_err(|e| anyhow::anyhow!("python call {handler}: {e}"))?;
             json_from_py(py, &result)
+        })
+    }
+
+    /// ADR-0034 generator mode: the handler is a native `yield`
+    /// generator and NEVER sees the wire shape. Start calls the handler
+    /// (creating the generator object; the body runs on first advance)
+    /// and parks it under the stream id. Next advances it one step:
+    /// a value → `{item, done: false}`, StopIteration → `{done: true}`
+    /// and the stream is dropped (exhaustion IS the end, symmetrically
+    /// encoded). Dispose sends GeneratorExit via `close()` and drops the
+    /// entry — idempotent. Mid-stream exceptions surface as errors
+    /// (failure values, ADR-0012).
+    fn iterate(&mut self, op: StreamOp) -> anyhow::Result<Value> {
+        Python::with_gil(|py| -> anyhow::Result<Value> {
+            let module = self
+                .module
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("python session: iterate before load"))?
+                .bind(py);
+            match op {
+                StreamOp::Start { stream_id, handler, args } => {
+                    if self.streams.contains_key(&stream_id) {
+                        anyhow::bail!("python iterate: stream id '{stream_id}' already live");
+                    }
+                    let func = module
+                        .getattr(&*handler)
+                        .map_err(|e| anyhow::anyhow!("python handler {handler}: {e}"))?;
+                    let args_py = json_to_py(py, &args)?;
+                    let gen = func
+                        .call1((args_py,))
+                        .map_err(|e| anyhow::anyhow!("python iterate start {handler}: {e}"))?;
+                    // A non-generator handler return is legal in python
+                    // semantics (the body ran to completion, no yield):
+                    // the stream is immediately done, value discarded.
+                    if gen.getattr("__next__").is_err() {
+                        return Ok(serde_json::json!({"done": true}));
+                    }
+                    self.streams.insert(stream_id.clone(), gen.unbind());
+                    // Start delivers the FIRST envelope (the realm
+                    // merges the stream_id into it): the pull that
+                    // started the stream is also the first pull —
+                    // nothing extra crosses for a consumer that breaks
+                    // before the first item.
+                    let gen = self
+                        .streams
+                        .get(&stream_id)
+                        .ok_or_else(|| anyhow::anyhow!("python iterate: stream vanished"))?
+                        .bind(py);
+                    match gen.call_method0("__next__") {
+                        Ok(item) => Ok(serde_json::json!({
+                            "item": json_from_py(py, &item)?,
+                            "done": false,
+                        })),
+                        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                            self.streams.remove(&stream_id);
+                            Ok(serde_json::json!({"done": true}))
+                        }
+                        Err(e) => {
+                            self.streams.remove(&stream_id);
+                            Err(anyhow::anyhow!("python iterate {stream_id}: {e}"))
+                        }
+                    }
+                }
+                StreamOp::Next { stream_id, .. } => {
+                    let gen = self
+                        .streams
+                        .get(&stream_id)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "python iterate: stream '{stream_id}' not live (evicted or already done)"
+                        ))?
+                        .bind(py);
+                    match gen.call_method0("__next__") {
+                        Ok(item) => Ok(serde_json::json!({
+                            "item": json_from_py(py, &item)?,
+                            "done": false,
+                        })),
+                        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                            self.streams.remove(&stream_id);
+                            Ok(serde_json::json!({"done": true}))
+                        }
+                        Err(e) => {
+                            // Mid-stream failure: the stream is dead —
+                            // drop it and hand the error back (ADR-0012).
+                            self.streams.remove(&stream_id);
+                            Err(anyhow::anyhow!("python iterate {stream_id}: {e}"))
+                        }
+                    }
+                }
+                StreamOp::Dispose { stream_id, .. } => {
+                    if let Some(gen) = self.streams.remove(&stream_id) {
+                        let _ = gen.bind(py).call_method0("close");
+                    }
+                    Ok(Value::Null)
+                }
+            }
         })
     }
 

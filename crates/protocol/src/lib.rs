@@ -11,6 +11,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The verb a ToolCall asks the session to perform (ADR-0034). One call
+/// machinery carries all four: Invoke is the single-value handler call,
+/// the Iterate* kinds pull a stateful stream produced inside the session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    #[default]
+    Invoke,
+    /// Begin a stream: run the handler as a producer under `stream` id.
+    IterateStart,
+    /// Pull one envelope `{item,done}` / `{done:true}` from the stream.
+    IterateNext,
+    /// Abandon the stream (consumer break, ADR-0034 §3). Idempotent.
+    IterateDispose,
+}
+
 /// One operation arriving at the Probe.
 ///
 /// The Probe ships no built-in operations and keeps no registry. `session`
@@ -23,6 +39,18 @@ pub struct ToolCall {
     /// Correlates the eventual ToolResult back to the caller (Gravity's
     /// pending_calls deadline scan reuses this id).
     pub call_id: String,
+    /// What this call asks the session to do (ADR-0034). `Invoke` is the
+    /// single-value handler call; the `Iterate*` kinds drive a stream
+    /// against the session's producer state, correlated by `stream`. The
+    /// envelope `{item,done,error?}` is schema, not protocol — the frame
+    /// vocabulary only names the verb.
+    #[serde(default)]
+    pub kind: CallKind,
+    /// Stream identity for the `Iterate*` kinds (minted by the control
+    /// plane at iterate start; `None` for Invoke). Same correlating role
+    /// as `call_id` for results — a frame identity, no new machinery.
+    #[serde(default)]
+    pub stream: Option<String>,
     /// Opaque residency identity, minted by the caller: the Probe keys its
     /// resident session by this value, so calls sharing a `session` share
     /// runtime state (VM / module globals) and calls with different values
@@ -137,6 +165,22 @@ pub enum HostOp {
         target_key: String,
         handler: String,
         args: serde_json::Value,
+    },
+    /// ADR-0034 consumer leg over the wire: a remote script booth starts,
+    /// pulls, and disposes a stream produced by another booth (resident
+    /// or remote — the envelope is the same on both sides). `stream_id`
+    /// is minted by the control plane at start and echoes back here.
+    Iterate {
+        target_type: String,
+        target_key: String,
+        handler: String,
+        args: serde_json::Value,
+    },
+    IterateNext {
+        stream_id: String,
+    },
+    IterateDispose {
+        stream_id: String,
     },
 }
 

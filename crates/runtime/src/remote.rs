@@ -153,6 +153,8 @@ async fn execute_call_inner(
     let language = call.language.clone();
     let entry = call.entry.clone();
     let args = call.args.clone();
+    let kind = call.kind;
+    let stream_id = call.stream.clone().unwrap_or_default();
     let sandbox = sandbox_policy_for(config);
     tokio::task::spawn_blocking(move || {
         sessions.with_session(
@@ -161,7 +163,23 @@ async fn execute_call_inner(
             &source,
             Some(&bridge),
             &sandbox,
-            |s: &mut dyn crate::carrier::session::ResidentSession| s.call(&entry, &args),
+            move |s: &mut dyn crate::carrier::session::ResidentSession| match kind {
+                probe_protocol::CallKind::Invoke => s.call(&entry, &args),
+                // ADR-0034 producer leg: the stream verbs drive the
+                // session's iterate surface (generator mode parks the
+                // native generator; envelope mode re-invokes the handler
+                // with the injected op). The stream_id is minted by the
+                // control plane — the probe derives nothing from it.
+                probe_protocol::CallKind::IterateStart => s.iterate(
+                    crate::carrier::session::StreamOp::Start { stream_id, handler: entry, args },
+                ),
+                probe_protocol::CallKind::IterateNext => s.iterate(
+                    crate::carrier::session::StreamOp::Next { stream_id, handler: entry, args },
+                ),
+                probe_protocol::CallKind::IterateDispose => s.iterate(
+                    crate::carrier::session::StreamOp::Dispose { stream_id, handler: entry, args },
+                ),
+            },
         )
     })
     .await
@@ -227,7 +245,63 @@ fn build_host_bridge(
         });
         bridge.functions.insert(name.to_string(), f);
     }
+    // ADR-0034 consumer legs over the wire: a remote script booth
+    // starting, pulling, and disposing a stream rides the same
+    // Frame::Host round trip as ctx_invoke — one send/receive path,
+    // three ops. The control plane mints the stream_id at start and
+    // echoes it back; the cursor loop lives in the script wrapper.
+    {
+        let ops = [("ctx_iter_start", HostOpArm::Start), ("ctx_iter_next", HostOpArm::Next), ("ctx_iter_dispose", HostOpArm::Dispose)];
+        for (name, arm) in ops {
+            let tx = tx.clone();
+            let pending = pending.clone();
+            let call_id = call_id.clone();
+            let f: crate::carrier::HostFn = Arc::new(move |arg: serde_json::Value| {
+                let (op_tx, op_rx) = tokio::sync::oneshot::channel();
+                let host_call_id = format!("host-{}-{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?.as_nanos(), std::process::id());
+                let m = match &arg {
+                    serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                        .unwrap_or(serde_json::Value::Null),
+                    other => other.clone(),
+                };
+                let gs = |k: &str| m.get(k).cloned().unwrap_or(serde_json::Value::Null);
+                let gs_s = |k: &str| gs(k).as_str().unwrap_or_default().to_string();
+                let op = match arm {
+                    HostOpArm::Start => HostOp::Iterate {
+                        target_type: gs_s("type"),
+                        target_key: gs_s("key"),
+                        handler: gs_s("handler"),
+                        args: gs("args"),
+                    },
+                    HostOpArm::Next => HostOp::IterateNext { stream_id: gs_s("stream_id") },
+                    HostOpArm::Dispose => HostOp::IterateDispose { stream_id: gs_s("stream_id") },
+                };
+                pending.lock().unwrap().insert(host_call_id.clone(), op_tx);
+                tx.send(Frame::Host(HostFrame::Call(HostCall {
+                    host_call_id: host_call_id.clone(),
+                    call_id: call_id.clone(),
+                    op,
+                })))
+                .map_err(|_| anyhow::anyhow!("connection closed"))?;
+                match op_rx.blocking_recv() {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
+                    Err(_) => Err(anyhow::anyhow!("host call dropped")),
+                }
+            });
+            bridge.functions.insert(name.to_string(), f);
+        }
+    }
     bridge
+}
+
+/// Which iterate op a bridge arm builds from the script's JSON arg.
+#[derive(Clone, Copy)]
+enum HostOpArm {
+    Start,
+    Next,
+    Dispose,
 }
 
 

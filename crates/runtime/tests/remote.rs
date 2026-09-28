@@ -35,6 +35,8 @@ async fn fake_control_plane(listener: TcpListener, code: CodeRef) {
     // name are separate: residency is keyed by `session` alone.
     let call = ToolCall {
         call_id: "c-1".into(),
+        kind: probe_protocol::CallKind::Invoke,
+        stream: None,
         session: "counter/k1".into(),
         entry: "counter".into(),
         language: "steel".into(),
@@ -162,6 +164,8 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         // Link call with the CORRECT hash: fetch, verify, execute.
         let call = ToolCall {
             call_id: "c-link".into(),
+            kind: probe_protocol::CallKind::Invoke,
+            stream: None,
             session: "triple/k1".into(),
             entry: "triple".into(),
             language: "steel".into(),
@@ -188,6 +192,8 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         // the HTTP source stays at exactly one hit across the exchange.
         let call = ToolCall {
             call_id: "c-cached".into(),
+            kind: probe_protocol::CallKind::Invoke,
+            stream: None,
             session: "triple/k2".into(),
             entry: "triple".into(),
             language: "steel".into(),
@@ -217,6 +223,8 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         // Link call with a WRONG hash: error value, never a silent accept.
         let call = ToolCall {
             call_id: "c-bad".into(),
+            kind: probe_protocol::CallKind::Invoke,
+            stream: None,
             session: "triple/k1".into(),
             entry: "triple".into(),
             language: "steel".into(),

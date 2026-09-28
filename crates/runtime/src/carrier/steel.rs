@@ -49,6 +49,15 @@ impl super::session::ResidentSession for SteelSession {
         steel_to_json(&val)
     }
 
+    /// ADR-0034 envelope mode: steel's generator shape is call/cc-based
+    /// and not reliably host-drivable across separate engine calls, so
+    /// the handler is a repeatedly callable function that returns the
+    /// `{item, done}` envelope explicitly (the framework injects
+    /// `{stream_id, op}` into args and validates the envelope).
+    fn iterate(&mut self, op: super::session::StreamOp) -> anyhow::Result<Value> {
+        super::session::envelope_pull(self, &op)
+    }
+
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -181,6 +190,7 @@ fn register_ctx_stubs(engine: &mut Engine) {
         "ctx_invoke", "ctx_store_emit", "ctx_interface_schema",
         "ctx_queue_depth", "ctx_skip_to_now",
         "ctx_timer_register", "ctx_timer_cancel",
+        "ctx_iter_start", "ctx_iter_next", "ctx_iter_dispose",
     ];
     for name in CTX_STUBS {
         let name: &'static str = Box::leak((*name).to_string().into_boxed_str());
