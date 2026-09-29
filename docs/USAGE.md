@@ -107,8 +107,16 @@ call, so residency keyed by it would start a cold runtime every time.
 
 `entry` names the entry point inside the delivered code. It is **not** a lookup
 key: the Probe keeps no registry and resolves nothing against its value. A name
-the code does not bind falls back to the conventional `execute` entry when the
-code defines one, and is an error value otherwise.
+the code does not bind is an error value, never a magic redirect (one
+execution shape per language, the dispatch-table ruling: languages with a
+runtime name lookup ride it — python/steel dict/getattr, wasm export table;
+languages without one hand-write a `main` + match on literal names).
+
+`kind`/`stream` carry the unified envelope's verbs (ADR-0036): every dispatch
+call is a stream op — `kind: "iterate_start"` (the default) with a minted
+`stream`, and an invoke is the stream whose first reply is terminal. The
+result's `Ok` payload is therefore an envelope (`{done: true, value: <ret>}`
+for a plain handler, whose bare return the carrier wrapped).
 
 `language` must be a carrier this node actually carries; an unknown or unbuilt
 language is an error value in `result`, not a dropped call.
@@ -117,6 +125,8 @@ language is an error value in `result`, not a dropped call.
 {
   "type": "call",
   "call_id": "rp-7",
+  "kind": "iterate_start",
+  "stream": "stream-12",
   "session": "notes/7",
   "entry": "read_file",
   "language": "python",
@@ -129,6 +139,8 @@ language is an error value in `result`, not a dropped call.
 {
   "type": "call",
   "call_id": "rp-8",
+  "kind": "iterate_start",
+  "stream": "stream-13",
   "session": "heavy/1",
   "entry": "main",
   "language": "wasmtime",
@@ -147,13 +159,16 @@ language is an error value in `result`, not a dropped call.
   Probe holds nothing between calls.
 
 ```json
-{ "type": "result", "call_id": "rp-7", "outcome": { "Ok": { "ok": true } } }
+{ "type": "result", "call_id": "rp-7", "outcome": { "Ok": { "done": true, "value": { "ok": true } } } }
 { "type": "result", "call_id": "rp-7", "outcome": { "Err": "unknown language 'koto'" } }
 ```
 
-Every `call` gets exactly one `result`, success or failure. Results are
-message-sized by discipline: large artifacts never travel the control plane — the
-operation handles them on the Probe side.
+Every `call` gets exactly one `result`, success or failure. The success
+payload is the unified envelope (ADR-0036 §1): a plain handler answers
+`{done: true, value}` — the carrier wrapped its bare return; a stream that
+started non-terminal answers `{done: false, item, stream_id}` on the Start
+round. Results are message-sized by discipline: large artifacts never travel
+the control plane — the operation handles them on the Probe side.
 
 ### 4.2 `host` — the ctx bridge
 
@@ -240,14 +255,14 @@ above; single-line here for the flow):
 ```
 probe → CP   {"type":"register","node_alias":"home-pc","credential":"tok-abc","carriers":["steel","python"]}
 CP → probe   {"type":"registered"}
-CP → probe   {"type":"call","call_id":"rp-7","session":"counter/k1","entry":"counter","language":"steel","args":{"n":4},"code":{"type":"inline","bytes":[40,100,101,102,105,110,101,32,40,101,120,101,99,117,116,101,32,97,114,103,115,41,32,40,104,97,115,104,32,34,110,34,32,52,41,41]}}
+CP → probe   {"type":"call","call_id":"rp-7","kind":"iterate_start","stream":"stream-9","session":"counter/k1","entry":"counter","language":"steel","args":{"n":4},"code":{"type":"inline","bytes":[40,100,101,102,105,110,101,32,40,99,111,117,110,116,101,114,32,97,114,103,115,41,32,40,104,97,115,104,32,34,110,34,32,52,41,41]}}
 probe → CP   {"type":"host","kind":"call","host_call_id":"h-1","call_id":"rp-7","op":{"op":"store_emit","instruction":{"collection":"counters","doc":{"visits":1},"key":{"id":1},"op":"put_document"}}}
 CP → probe   {"type":"host","kind":"result","host_call_id":"h-1","outcome":{"Ok":{"ok":true}}}
-probe → CP   {"type":"result","call_id":"rp-7","outcome":{"Ok":{"n":4}}}
+probe → CP   {"type":"result","call_id":"rp-7","outcome":{"Ok":{"done":true,"value":{"n":4}}}}
 ```
 
 (`bytes` is a byte array: the probe's code payload here is the steel source
-`(define (execute args) (hash "n" 4))`. The assembly is illustrative — a script
+`(define (counter args) (hash "n" 4))`. The assembly is illustrative — a script
 that emits one storage instruction and then returns is just one of the shapes a
 call can take.)
 

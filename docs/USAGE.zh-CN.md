@@ -74,7 +74,9 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 
 `session` 是调用方给的不透明**驻留身份**：Probe 用它给常驻运行时定键（`probe/<node_alias>/<session>`），所以共享同一 `session` 的调用共享运行时状态（VM / module 全局），不同值之间绝不共享。它必须跨调用稳定——上游摊位 的 `type/key` 是自然取值。每次调用唯一的 `call_id` 顶不了这个位置：拿它定键等于每次都冷启一个运行时。
 
-`entry` 是所交付代码里的入口点名字。它**不是**查表键：Probe 没有注册表，也不拿它的值解析任何东西。代码没有绑定这个名字时，若代码定义了惯例入口 `execute` 就落到它，否则就是错误值。
+`entry` 是所交付代码里的入口点名字。它**不是**查表键：Probe 没有注册表，也不拿它的值解析任何东西。代码没有绑定这个名字时就是错误值，绝无魔法回落（每语言一种执行形态，分派表裁决：有运行时查表的语言用它——python/steel 的 dict/getattr、wasm 的导出表；没有的手写 `main` + match 字面名）。
+
+`kind`/`stream` 承载统一信封的动词（ADR-0036）：每个派发调用都是流动词——`kind: "iterate_start"`（默认）带铸造的 `stream`，而 invoke 是首轮应答即终止的那个流。于是 `result` 的 `Ok` 载荷就是信封（plain handler 答 `{done: true, value: <返回>}`——裸返回由【载体】包成信封）。
 
 `language` 必须是本节点真正携带的 carrier；未知或未编译进来的语言会体现在 `result` 的错误值里，而不是丢掉这次调用。
 
@@ -82,11 +84,13 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 {
   "type": "call",
   "call_id": "rp-7",
+  "kind": "iterate_start",
+  "stream": "stream-12",
   "session": "notes/7",
   "entry": "read_file",
   "language": "python",
   "args": { "path": "/tmp/x" },
-  "code": { "type": "inline", "bytes": [100, 101, 102, 32, 101, 120, 101, 99, 117, 116, 101, 40, 97, 114, 103, 115, 41, 58, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 97, 114, 103, 115] }
+  "code": { "type": "inline", "bytes": [100, 101, 102, 32, 114, 101, 97, 100, 95, 102, 105, 108, 101, 40, 97, 114, 103, 115, 41, 58, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 97, 114, 103, 115] }
 }
 ```
 
@@ -94,6 +98,8 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 {
   "type": "call",
   "call_id": "rp-8",
+  "kind": "iterate_start",
+  "stream": "stream-13",
   "session": "heavy/1",
   "entry": "main",
   "language": "wasmtime",
@@ -109,11 +115,11 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 - `link` —— Probe GET `url`（30 秒超时），在**执行之前**用 `expected_sha256` 校验 sha256，不匹配即错误值（绝不静默接受）。这个 URL 是 CDN 缓存键，不是 Probe 侧缓存：Probe 在调用之间不持有任何东西。
 
 ```json
-{ "type": "result", "call_id": "rp-7", "outcome": { "Ok": { "ok": true } } }
+{ "type": "result", "call_id": "rp-7", "outcome": { "Ok": { "done": true, "value": { "ok": true } } } }
 { "type": "result", "call_id": "rp-7", "outcome": { "Err": "unknown language 'koto'" } }
 ```
 
-每个 `call` 恰好得到一条 `result`，无论成功还是失败。结果按纪律保持在消息量级：大产物不走控制平面——由操作在 Probe 一侧自行处理。
+每个 `call` 恰好得到一条 `result`，无论成功还是失败。成功载荷是统一信封（ADR-0036 §1）：plain handler 答 `{done: true, value}`——裸返回由载体包好；非终止起步的流在 Start 轮答 `{done: false, item, stream_id}`。结果按纪律保持在消息量级：大产物不走控制平面——由操作在 Probe 一侧自行处理。
 
 ### 4.2 `host` —— ctx 桥
 
@@ -173,13 +179,13 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 ```
 probe → CP   {"type":"register","node_alias":"home-pc","credential":"tok-abc","carriers":["steel","python"]}
 CP → probe   {"type":"registered"}
-CP → probe   {"type":"call","call_id":"rp-7","session":"counter/k1","entry":"counter","language":"steel","args":{"n":4},"code":{"type":"inline","bytes":[40,100,101,102,105,110,101,32,40,101,120,101,99,117,116,101,32,97,114,103,115,41,32,40,104,97,115,104,32,34,110,34,32,52,41,41]}}
+CP → probe   {"type":"call","call_id":"rp-7","kind":"iterate_start","stream":"stream-9","session":"counter/k1","entry":"counter","language":"steel","args":{"n":4},"code":{"type":"inline","bytes":[40,100,101,102,105,110,101,32,40,99,111,117,110,116,101,114,32,97,114,103,115,41,32,40,104,97,115,104,32,34,110,34,32,52,41,41]}}
 probe → CP   {"type":"host","kind":"call","host_call_id":"h-1","call_id":"rp-7","op":{"op":"store_emit","instruction":{"collection":"counters","doc":{"visits":1},"key":{"id":1},"op":"put_document"}}}
 CP → probe   {"type":"host","kind":"result","host_call_id":"h-1","outcome":{"Ok":{"ok":true}}}
-probe → CP   {"type":"result","call_id":"rp-7","outcome":{"Ok":{"n":4}}}
+probe → CP   {"type":"result","call_id":"rp-7","outcome":{"Ok":{"done":true,"value":{"n":4}}}}
 ```
 
-（`bytes` 是字节数组：这里 probe 的代码载荷是 steel 源码 `(define (execute args) (hash "n" 4))`。这段拼接是示意性的——"先写 ctx 状态再返回"只是调用可以长的众多形状之一。）
+（`bytes` 是字节数组：这里 probe 的代码载荷是 steel 源码 `(define (counter args) (hash "n" 4))`。这段拼接是示意性的——"先写 ctx 状态再返回"只是调用可以长的众多形状之一。）
 
 ## 8. 失败语义
 
