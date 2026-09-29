@@ -18,13 +18,18 @@ pub trait ResidentSession: Send {
     fn load(&mut self, source: &str) -> Result<()>;
     /// Invoke one handler by name with parsed JSON args.
     fn call(&mut self, handler: &str, args: &Value) -> Result<Value>;
-    /// Drive one stream op (ADR-0034). Envelope-mode carriers (steel,
+    /// Drive one stream op (ADR-0034, unified envelope ADR-0036 — THE
+    /// job seam: every handler response is an envelope, and `call` is
+    /// the raw carrier-internal primitive underneath it, never the
+    /// dispatch seam). Envelope-mode carriers (steel,
     /// wasm — languages without a host-drivable generator protocol; a
     /// Rust wasm guest maps its own `Iterator` inside the
     /// module and returns the envelope at the ABI edge) delegate to
     /// `envelope_pull`; carriers with a native generator the host can
     /// park and step (python) override and never let the handler see
-    /// the wire shape.
+    /// the wire shape. A plain (non-streaming) Start answers
+    /// `{done: true, value: <ret>}` — the carrier wraps, the handler
+    /// never writes the envelope sugar for an invoke (0036 §2).
     fn iterate(&mut self, op: StreamOp) -> Result<Value>;
     /// Downcast support (carrier-specific introspection, e.g. wasm's
     /// export-list derivation).
@@ -76,43 +81,120 @@ impl StreamOp {
     }
 }
 
+/// The unified envelope (ADR-0036 §1): one shape for EVERY handler
+/// response — a terminal one with an optional `value`, or a
+/// non-terminal one with an `item`. `done` is always present and
+/// always boolean; the cross-field rules are enforced, not convention:
+/// `item` only with `done: false`, `value` only with `done: true`, and
+/// a non-terminal round without an `item` is a protocol error (the
+/// generator-mode null-start reply is gone — the pull that starts a
+/// stream IS the first pull and answers its first envelope).
+///
+/// `fresh` says whether this is the Start round. The one freedom the
+/// ADR grants at Start (§2, "plain returns wrap to terminal envelopes
+/// AT THE CARRIER"): a reply with no `done` field is a plain return —
+/// wrapped into `{done: true, value: <reply>}`. Mid-stream (Next) a
+/// missing `done` is exactly what the positional heuristic used to
+/// hide: an error, never a silent terminal.
+pub(crate) fn validate_envelope(reply: Value, fresh: bool, handler: &str) -> Result<Value> {
+    let done = reply.get("done").and_then(|v| v.as_bool());
+    match done {
+        Some(true) => {
+            if reply.get("item").is_some() {
+                anyhow::bail!("envelope with `done: true` must not carry an `item` (ADR-0036)");
+            }
+            Ok(reply)
+        }
+        Some(false) => {
+            if reply.get("item").is_none() {
+                anyhow::bail!(
+                    "envelope handler '{handler}': `done: false` must carry an `item` (ADR-0036)"
+                );
+            }
+            if reply.get("value").is_some() {
+                anyhow::bail!(
+                    "envelope handler '{handler}': `value` is legal only with `done: true` (ADR-0036)"
+                );
+            }
+            Ok(reply)
+        }
+        None => {
+            if fresh {
+                // Plain return → terminal envelope (ADR-0036 §2). The
+                // injected `iterate` tag is FRAMEWORK vocabulary riding
+                // the args — a handler that echoes its args back would
+                // hand our own injection right into the result, so it
+                // is stripped from the wrapped value (`iterate` is
+                // reserved: a handler returning that key mid-envelope
+                // rides the object below, never this branch).
+                let value = match reply {
+                    Value::Object(mut map) => {
+                        map.remove("iterate");
+                        Value::Object(map)
+                    }
+                    other => other,
+                };
+                Ok(serde_json::json!({ "done": true, "value": value }))
+            } else if reply.get("error").is_some() {
+                // The out-of-process children's failure convention
+                // (`{"error": "..."}` with no envelope — the bgi
+                // fixtures' shape): a mid-stream failure surfaces as the
+                // outer error value (ADR-0012), never a fake envelope.
+                let msg = reply.get("error").and_then(|v| v.as_str()).unwrap_or("stream error");
+                anyhow::bail!("iterate: producer error: {msg}")
+            } else {
+                anyhow::bail!(
+                    "iterate: envelope handler '{handler}' must return an object with a boolean \
+                     `done` field (ADR-0036)"
+                )
+            }
+        }
+    }
+}
+
 /// The envelope-mode iteration shape (ADR-0034 §1, languages without a
 /// host-drivable generator protocol — steel, wasm): the handler
 /// is a repeatedly callable function that returns the envelope
 /// explicitly. The framework injects `{stream_id, op}` into the args,
-/// forwards the call, and validates that the reply carries a boolean
-/// `done` field. `done: true` is WRITTEN, not derived — the validation
-/// narrows the guard-value footgun, it does not eliminate it.
+/// forwards the call, and validates the reply against the unified
+/// envelope. `done: true` is WRITTEN, not derived — the validation
+/// narrows the guard-value footgun, it does not eliminate it. A plain
+/// (envelope-free) Start reply wraps to a terminal envelope here, at
+/// the carrier (ADR-0036 §2).
 pub(crate) fn envelope_pull(session: &mut dyn ResidentSession, op: &StreamOp) -> Result<Value> {
     let mut args = op.args().clone();
     let inject = serde_json::json!({
         "stream_id": op.stream_id(),
         "op": op.tag(),
     });
-    match &mut args {
+    let injected = match &mut args {
         Value::Object(map) => {
             map.insert("iterate".into(), inject);
+            true
         }
         Value::Null => {
             args = Value::Object([("iterate".to_string(), inject)].into_iter().collect());
+            true
         }
-        other => anyhow::bail!("iterate: handler args must be an object, got {other}"),
+        // Non-object args cannot carry the injection — the handler is
+        // addressed bare. A Start answers the plain/invoke shape; a
+        // stream verb cannot be driven without the tag (no envelope
+        // vocabulary reaches the handler) — named as an error value.
+        _ => false,
+    };
+    if !injected && !matches!(op, StreamOp::Start { .. }) {
+        anyhow::bail!(
+            "iterate: envelope-mode stream verbs need object args (the `{{stream_id, op}}` \
+             tag rides them) — handler '{}' got {}",
+            op.handler(),
+            op.args()
+        );
     }
     let envelope = session.call(op.handler(), &args)?;
     if matches!(op, StreamOp::Dispose { .. }) {
         return Ok(Value::Null);
     }
-    let done = envelope
-        .get("done")
-        .and_then(|v| v.as_bool())
-        .ok_or_else(|| anyhow::anyhow!(
-            "iterate: envelope handler '{}' must return an object with a boolean `done` field (ADR-0034)",
-            op.handler()
-        ))?;
-    if done && envelope.get("item").is_some() {
-        anyhow::bail!("iterate: envelope with `done: true` must not carry an `item`");
-    }
-    Ok(envelope)
+    validate_envelope(envelope, matches!(op, StreamOp::Start { .. }), op.handler())
 }
 /// Per-instance slot: the session plus its own lock. The lock is held only
 /// for the duration of one call on THAT instance — other instances proceed

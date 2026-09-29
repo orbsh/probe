@@ -43,26 +43,20 @@ fn main() {
         let args = req.get("args").cloned().unwrap_or(Value::Null);
         let stream_id = req.get("stream_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+        // Unified seam (ADR-0036): dispatch jobs arrive as
+        // `iterate_start` — invoke is the stream whose first round is
+        // terminal. A plain handler replies with a bare value (no `done`
+        // field); the carrier wraps it to `{done:true,value}` (0036 §2).
+        // The bare `call` kind rides the same arms: it stays the
+        // carrier-internal primitive (introspection, probe-side tests)
+        // while the aura dispatch seam has folded onto the stream verb.
         match (kind.as_str(), event.as_str()) {
-            // Plain handler: echo the args — the invoke shape.
-            ("call", "echo") => reply(&mut out, id, serde_json::json!({"echoed": args})),
-            // A genuinely slow handler (the deadline tests need real
-            // latency a hot timeout can beat): one second, synchronous.
-            ("call", "slow") => {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                reply(&mut out, id, args.clone());
-            }
-            // Upload-time introspection (ADR-0035: the child declares
-            // its receives in its own code — the frame protocol carries
-            // the same JSON schema shape every carrier's interface_schema
-            // returns). The storage block is the hand-written literal,
-            // the same shape steel/nushell declare: `counters` keyed by
-            // `id`, one `count` field (ADR-0026 §4).
-            ("call", "interface_schema") => reply(
+            // Introspection answers the same schema either way.
+            ("call", "interface_schema") | ("iterate_start", "interface_schema") => reply(
                 &mut out,
                 id,
                 serde_json::json!({
-                    "receives": { "echo": {}, "slow": {}, "ctx_round_trip": {}, "store_round_trip": {} },
+                    "receives": { "echo": {}, "slow": {}, "ctx_round_trip": {}, "store_round_trip": {}, "count": {} },
                     "wildcard_receives": [],
                     "storage": { "collections": { "counters": { "schema": {
                         "key_len": 8,
@@ -76,8 +70,17 @@ fn main() {
                     }}}}
                 }),
             ),
+            // Plain handlers: reply a bare value; the carrier wraps to a
+            // terminal envelope. echo echoes the args.
+            ("call" | "iterate_start", "echo") => reply(&mut out, id, serde_json::json!({"echoed": args})),
+            // A genuinely slow handler (the deadline tests need real
+            // latency a hot timeout can beat): one second, synchronous.
+            ("call" | "iterate_start", "slow") => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                reply(&mut out, id, args.clone());
+            }
             // Plain handler: ONE host round trip, then forward the answer.
-            ("call", "ctx_round_trip") => {
+            ("call" | "iterate_start", "ctx_round_trip") => {
                 emit(
                     &mut out,
                     &serde_json::json!({"host": {"op": "ctx_invoke", "args": args}}),
@@ -104,7 +107,7 @@ fn main() {
             // then read-back — and answers with what the host's store
             // read returns. Pure transport: the child never parses the
             // instruction, exactly the rule the wire enforces.
-            ("call", "store_round_trip") => {
+            ("iterate_start", "store_round_trip") => {
                 let mut host_call = |v: &Value| {
                     emit(&mut out, &serde_json::json!({"host": {"op": "ctx_store_emit", "args": v}}));
                     loop {
@@ -126,9 +129,10 @@ fn main() {
                 let read_back = host_call(&get);
                 reply(&mut out, id, serde_json::json!({"read_back": read_back}));
             }
-            // iterate_start: register the guard; the first round carries
-            // the first item (ADR-0034: Start is also the first pull).
-            ("iterate_start", _) => {
+            // Streaming producer (`count`): iterate_start registers the
+            // guard and the first round carries the first item (ADR-0034
+            // — Start is also the first pull); a total of 0 is terminal.
+            ("iterate_start", "count") => {
                 let total = args.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                 if total == 0 {
                     reply(&mut out, id, serde_json::json!({"done": true}));

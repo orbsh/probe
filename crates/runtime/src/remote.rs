@@ -163,13 +163,14 @@ async fn execute_call_inner(
             &source,
             Some(&bridge),
             &sandbox,
+            // Unified seam (ADR-0036): every dispatch job is a stream
+            // op — invoke is the stream whose first round is terminal
+            // (plain handlers answer bare, the carrier wraps to
+            // `{done:true,value}`). The generator/envelope verbs drive
+            // the session's iterate surface exactly as ADR-0034; the
+            // stream_id is minted by the control plane — the probe
+            // derives nothing from it.
             move |s: &mut dyn crate::carrier::session::ResidentSession| match kind {
-                probe_protocol::CallKind::Invoke => s.call(&entry, &args),
-                // ADR-0034 producer leg: the stream verbs drive the
-                // session's iterate surface (generator mode parks the
-                // native generator; envelope mode re-invokes the handler
-                // with the injected op). The stream_id is minted by the
-                // control plane — the probe derives nothing from it.
                 probe_protocol::CallKind::IterateStart => s.iterate(
                     crate::carrier::session::StreamOp::Start { stream_id, handler: entry, args },
                 ),

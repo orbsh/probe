@@ -11,17 +11,18 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The verb a ToolCall asks the session to perform (ADR-0034). One call
-/// machinery carries all four: Invoke is the single-value handler call,
-/// the Iterate* kinds pull a stateful stream produced inside the session.
+/// The verb a ToolCall asks the session to perform (ADR-0034, unified
+/// envelope ADR-0036 — the Invoke kind retired: every dispatch job is a
+/// stream op, invoke is the stream whose first round is terminal,
+/// `IterateStart` with a plain handler reply is exactly an invoke).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallKind {
-    #[default]
-    Invoke,
     /// Begin a stream: run the handler as a producer under `stream` id.
+    #[default]
     IterateStart,
-    /// Pull one envelope `{item,done}` / `{done:true}` from the stream.
+    /// Pull one envelope `{item, done:false}` / `{done:true, value?}`
+    /// from the stream.
     IterateNext,
     /// Abandon the stream (consumer break, ADR-0034 §3). Idempotent.
     IterateDispose,
@@ -39,16 +40,20 @@ pub struct ToolCall {
     /// Correlates the eventual ToolResult back to the caller (Gravity's
     /// pending_calls deadline scan reuses this id).
     pub call_id: String,
-    /// What this call asks the session to do (ADR-0034). `Invoke` is the
-    /// single-value handler call; the `Iterate*` kinds drive a stream
-    /// against the session's producer state, correlated by `stream`. The
-    /// envelope `{item,done,error?}` is schema, not protocol — the frame
-    /// vocabulary only names the verb.
+    /// What this call asks the session to do (ADR-0034, unified
+    /// envelope ADR-0036). Every dispatch job is a stream op:
+    /// `IterateStart` runs the handler as a producer (a plain handler is
+    /// legal there — its bare reply wraps to `{done:true,value}` at the
+    /// carrier, which IS an invoke), the other kinds drive the stream.
+    /// The envelope is schema, not protocol — the frame vocabulary only
+    /// names the verb.
     #[serde(default)]
     pub kind: CallKind,
-    /// Stream identity for the `Iterate*` kinds (minted by the control
-    /// plane at iterate start; `None` for Invoke). Same correlating role
-    /// as `call_id` for results — a frame identity, no new machinery.
+    /// Stream identity the `Iterate*` kinds correlate by (minted by the
+    /// control plane at start; every dispatch frame carries it — ADR-0036
+    /// retired the Invoke kind, no job travels without a stream id).
+    /// Same correlating role as `call_id` for results — a frame
+    /// identity, no new machinery.
     #[serde(default)]
     pub stream: Option<String>,
     /// Opaque residency identity, minted by the caller: the Probe keys its

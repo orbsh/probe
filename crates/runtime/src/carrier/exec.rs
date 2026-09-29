@@ -411,9 +411,13 @@ impl ResidentSession for BgiSession {
         }))
     }
 
-    /// ADR-0034 over the bgi seam: the stream verbs are request frames —
-    /// the child keeps whatever guard state or generator its language
-    /// offers, the envelope rule is the ADR's, unchanged.
+    /// ADR-0034 over the bgi seam, unified envelope (ADR-0036): the
+    /// stream verbs are request frames — the child keeps whatever guard
+    /// state or generator its language offers — and the child's reply is
+    /// envelope-validated here: a plain Start reply (no `done`) wraps to
+    /// `{done: true, value: <reply>}` at the carrier; mid-stream rounds
+    /// must write the envelope. The seam op set is FROZEN (ADR-0037 —
+    /// this transitional JSON document retires with CBOR).
     fn iterate(&mut self, op: StreamOp) -> Result<Value> {
         let (kind, event, op_tag, args, stream_id) = match &op {
             StreamOp::Start { stream_id, handler, args } => {
@@ -426,10 +430,19 @@ impl ResidentSession for BgiSession {
                 ("iterate_dispose", handler, "dispose", args, stream_id)
             }
         };
-        self.exchange(serde_json::json!({
+        let fresh = matches!(op, StreamOp::Start { .. });
+        let reply = self.exchange(serde_json::json!({
             "kind": kind, "event": event, "op": op_tag,
             "args": args, "stream_id": stream_id,
-        }))
+        }))?;
+        match &op {
+            // Dispose has no envelope reply (the routing entry already
+            // left; the answer is success).
+            StreamOp::Dispose { .. } => Ok(reply),
+            // Start AND Next are envelope rounds: Start's plain reply
+            // wraps to terminal, Next's missing `done` is an error.
+            _ => super::session::validate_envelope(reply, fresh, event),
+        }
     }
 
     fn as_any(&mut self) -> &mut dyn std::any::Any {
@@ -520,12 +533,25 @@ impl ResidentSession for OneShotSession {
         self.inner.run(handler, args)
     }
 
-    fn iterate(&mut self, _op: StreamOp) -> Result<Value> {
-        Err(anyhow!(
-            "exec carrier: one-shot booths carry no stream state (ADR-0035 — \
-             the cgi shape is stateless by definition; use bgi for residency) \
-             — no stream is started"
-        ))
+    /// Unified seam (ADR-0036): a Start runs the one-shot and the
+    /// carrier wraps its bare stdout into `{done: true, value}` — the
+    /// invoke shape (the script stays protocol-free, ADR-0035 §4: the
+    /// exec form has no envelope to write). Next/Dispose stay named
+    /// errors: a one-shot booth has no residency to hold a stream
+    /// (same ruling as Rust closure bodies, ADR-0034 — the cgi lineage
+    /// is stateless by definition, not by omission).
+    fn iterate(&mut self, op: StreamOp) -> Result<Value> {
+        match op {
+            StreamOp::Start { handler, args, .. } => {
+                let value = self.inner.run(&handler, &args)?;
+                Ok(serde_json::json!({ "done": true, "value": value }))
+            }
+            StreamOp::Next { .. } | StreamOp::Dispose { .. } => Err(anyhow!(
+                "exec carrier: one-shot booths carry no stream state (ADR-0035 — \
+                 the cgi shape is stateless by definition; use bgi for residency) \
+                 — no stream is started"
+            )),
+        }
     }
 
     fn as_any(&mut self) -> &mut dyn std::any::Any {

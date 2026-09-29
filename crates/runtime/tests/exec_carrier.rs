@@ -174,8 +174,12 @@ fn bgi_iterate_stream() {
                 })
             },
         )
-        .unwrap();
-    assert!(late.get("error").is_some(), "unknown stream is an error value, got {late}");
+        .unwrap_err()
+        .to_string();
+    assert!(
+        late.contains("unknown stream"),
+        "unknown stream is an error value (ADR-0012), got {late}"
+    );
 }
 
 /// exec (the bare cgi shape): one process per call, NO protocol — the
@@ -205,9 +209,12 @@ fn exec_oneshot_runs_per_call() {
     assert!(s.sweep_dead().is_empty(), "one-shot slots are never 'dead'");
 }
 
-/// The statelessness is asserted, not assumed: iterate on a one-shot
-/// booth is an error value that NAMES the design (the cgi lineage has
-/// no residency to hold a stream — the fix is bgi, not a retry).
+/// The statelessness is asserted, not assumed. Unified seam (ADR-0036):
+/// a Start on a one-shot IS the invoke shape — it runs the script and
+/// wraps stdout into `{done:true,value}` (bare script, carrier-wrapped).
+/// The STREAM is what a one-shot cannot do: the follow-up Next names the
+/// design as an error value (the cgi lineage has no residency to hold a
+/// stream — the fix is bgi, not a retry).
 #[test]
 fn exec_oneshot_iterate_is_a_named_error() {
     let s = sessions();
@@ -219,10 +226,22 @@ fn exec_oneshot_iterate_is_a_named_error() {
         None,
         &probe_runtime::sandbox::SandboxPolicy::None,
         |sess| {
-            sess.iterate(StreamOp::Start {
+            let start = sess.iterate(StreamOp::Start {
                 stream_id: "s1".into(),
                 handler: "count".into(),
                 args: json!({"total": 2}),
+            })?;
+            // Start answers the terminal invoke envelope...
+            assert_eq!(
+                start.get("done").and_then(|d| d.as_bool()),
+                Some(true),
+                "a one-shot Start is terminal (invoke shape): {start}"
+            );
+            // ...and the stream verb after it names the design.
+            sess.iterate(StreamOp::Next {
+                stream_id: "s1".into(),
+                handler: "count".into(),
+                args: json!({}),
             })
         },
     );

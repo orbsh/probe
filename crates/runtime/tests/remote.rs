@@ -35,8 +35,8 @@ async fn fake_control_plane(listener: TcpListener, code: CodeRef) {
     // name are separate: residency is keyed by `session` alone.
     let call = ToolCall {
         call_id: "c-1".into(),
-        kind: probe_protocol::CallKind::Invoke,
-        stream: None,
+        kind: probe_protocol::CallKind::IterateStart,
+        stream: Some("s-1".into()),
         session: "counter/k1".into(),
         entry: "counter".into(),
         language: "steel".into(),
@@ -56,7 +56,7 @@ async fn fake_control_plane(listener: TcpListener, code: CodeRef) {
     match serde_json::from_str::<Frame>(&text).unwrap() {
         Frame::Result(ToolResult { call_id, outcome }) => {
             assert_eq!(call_id, "c-1");
-            assert_eq!(outcome.unwrap(), serde_json::json!({"doubled": 6}));
+            assert_eq!(outcome.unwrap(), serde_json::json!({"done": true, "value": {"doubled": 6}}));
         }
         other => panic!("expected Result, got {other:?}"),
     }
@@ -164,8 +164,8 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         // Link call with the CORRECT hash: fetch, verify, execute.
         let call = ToolCall {
             call_id: "c-link".into(),
-            kind: probe_protocol::CallKind::Invoke,
-            stream: None,
+            kind: probe_protocol::CallKind::IterateStart,
+            stream: Some("s-1".into()),
             session: "triple/k1".into(),
             entry: "triple".into(),
             language: "steel".into(),
@@ -182,7 +182,7 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         match serde_json::from_str::<Frame>(msg.to_text().unwrap()).unwrap() {
             Frame::Result(r) => {
                 assert_eq!(r.call_id, "c-link");
-                assert_eq!(r.outcome.unwrap(), serde_json::json!({"tripled": 15}));
+                assert_eq!(r.outcome.unwrap(), serde_json::json!({"done": true, "value": {"tripled": 15}}));
             }
             other => panic!("expected Result, got {other:?}"),
         }
@@ -192,8 +192,8 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         // the HTTP source stays at exactly one hit across the exchange.
         let call = ToolCall {
             call_id: "c-cached".into(),
-            kind: probe_protocol::CallKind::Invoke,
-            stream: None,
+            kind: probe_protocol::CallKind::IterateStart,
+            stream: Some("s-1".into()),
             session: "triple/k2".into(),
             entry: "triple".into(),
             language: "steel".into(),
@@ -210,7 +210,7 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         match serde_json::from_str::<Frame>(msg.to_text().unwrap()).unwrap() {
             Frame::Result(r) => {
                 assert_eq!(r.call_id, "c-cached");
-                assert_eq!(r.outcome.unwrap(), serde_json::json!({"tripled": 6}));
+                assert_eq!(r.outcome.unwrap(), serde_json::json!({"done": true, "value": {"tripled": 6}}));
             }
             other => panic!("expected Result, got {other:?}"),
         }
@@ -223,8 +223,8 @@ async fn code_ref_fetch_verify_cache_and_mismatch_rejection() {
         // Link call with a WRONG hash: error value, never a silent accept.
         let call = ToolCall {
             call_id: "c-bad".into(),
-            kind: probe_protocol::CallKind::Invoke,
-            stream: None,
+            kind: probe_protocol::CallKind::IterateStart,
+            stream: Some("s-1".into()),
             session: "triple/k1".into(),
             entry: "triple".into(),
             language: "steel".into(),

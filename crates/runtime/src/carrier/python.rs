@@ -72,7 +72,13 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
     // arrives with the Start round trip (stream_id merged by the realm),
     // `done: true` ends the loop (StopIteration — structural, not a
     // sentinel), and abandoning mid-loop raises GeneratorExit into this
-    // frame, whose `finally` sends dispose. Args marshal as JSON strings
+    // frame, whose `finally` sends dispose. Unified envelope (ADR-0036):
+    // the Start reply may be TERMINAL (invoke shape — the stream never
+    // opened, no stream_id present), and the terminal round may carry a
+    // `value`; it lands on `ctx_iterate.last_value` for the consumer
+    // that wants it (native `for` iteration discards it — the ADR §3
+    // rule; `ctx_invoke` is the shape that unwraps values).
+    // Args marshal as JSON strings
     // — the PyCFunction seam extracts String (same contract the other
     // ctx host fns use).
     let globals = module.dict();
@@ -82,16 +88,21 @@ fn load_module<'py>(py: Python<'py>, source: &str) -> PyResult<(Bound<'py, PyMod
 import json as _aura_json
 
 def ctx_iterate(booth_type, booth_key, handler, args=None):
-    first = ctx_iter_start(_aura_json.dumps({
+    env = ctx_iter_start(_aura_json.dumps({
         "type": booth_type, "key": booth_key,
         "handler": handler, "args": args if args is not None else {},
     }))
-    stream_id = first["stream_id"]
-    env = first
+    ctx_iterate.last_value = env.get("value")
+    if env.get("done"):
+        return
+    stream_id = env["stream_id"]
     try:
-        while not env.get("done"):
+        while True:
             yield env["item"]
             env = ctx_iter_next(_aura_json.dumps({"stream_id": stream_id}))
+            ctx_iterate.last_value = env.get("value")
+            if env.get("done"):
+                break
     finally:
         # Mid-stream abandonment (break / GeneratorExit / error before
         # done): dispose is the mandatory dual. Idempotent realm-side —
@@ -299,11 +310,15 @@ impl super::session::ResidentSession for PythonSession {
                     let gen = func
                         .call1((args_py,))
                         .map_err(|e| anyhow::anyhow!("python iterate start {handler}: {e}"))?;
-                    // A non-generator handler return is legal in python
+                    // A non-generator handler return is legal python
                     // semantics (the body ran to completion, no yield):
-                    // the stream is immediately done, value discarded.
+                    // unified envelope (ADR-0036 §2) — the plain return
+                    // IS the terminal `value`, invoke's shape.
                     if gen.getattr("__next__").is_err() {
-                        return Ok(serde_json::json!({"done": true}));
+                        return Ok(serde_json::json!({
+                            "done": true,
+                            "value": json_from_py(py, &gen)?,
+                        }));
                     }
                     self.streams.insert(stream_id.clone(), gen.unbind());
                     // Start delivers the FIRST envelope (the realm
@@ -323,7 +338,17 @@ impl super::session::ResidentSession for PythonSession {
                         })),
                         Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
                             self.streams.remove(&stream_id);
-                            Ok(serde_json::json!({"done": true}))
+                            // StopIteration.value: a generator's `return x`
+                            // is the stream's terminal value (ADR-0036 §2 —
+                            // the host language already unifies this; the
+                            // wire follows).
+                            match stop_iteration_value(py, &e) {
+                                Some(v) => Ok(serde_json::json!({
+                                    "done": true,
+                                    "value": json_from_py(py, &v)?,
+                                })),
+                                None => Ok(serde_json::json!({ "done": true })),
+                            }
                         }
                         Err(e) => {
                             self.streams.remove(&stream_id);
@@ -346,7 +371,13 @@ impl super::session::ResidentSession for PythonSession {
                         })),
                         Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
                             self.streams.remove(&stream_id);
-                            Ok(serde_json::json!({"done": true}))
+                            match stop_iteration_value(py, &e) {
+                                Some(v) => Ok(serde_json::json!({
+                                    "done": true,
+                                    "value": json_from_py(py, &v)?,
+                                })),
+                                None => Ok(serde_json::json!({ "done": true })),
+                            }
                         }
                         Err(e) => {
                             // Mid-stream failure: the stream is dead —
@@ -410,6 +441,15 @@ fn merge_schema(derived: Value, explicit: Value) -> Value {
     // decorators did not declare still contribute (the script may know a
     // receive the decorators cannot express).
     out
+}
+
+/// The payload of a StopIteration: `return x` inside a generator sets
+/// the exception's `value` attribute (ADR-0036 §2 — the framework reads
+/// `.value`, not just the exception). A bare `return` / exhaustion with
+/// no value attribute (or None) projects to the empty terminal.
+fn stop_iteration_value<'py>(py: Python<'py>, e: &pyo3::PyErr) -> Option<Bound<'py, PyAny>> {
+    let inst = e.value(py);
+    inst.getattr("value").ok().filter(|v| !v.is_none())
 }
 
 fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {

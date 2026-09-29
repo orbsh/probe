@@ -4,7 +4,7 @@ use probe_protocol::{CodeRef, ToolCall};
 fn roundtrip_call_carries_a_code_reference() {
     let call = ToolCall {
         call_id: "c1".into(),
-        kind: probe_protocol::CallKind::Invoke,
+        kind: probe_protocol::CallKind::IterateStart,
         stream: None,
         session: "notes/7".into(),
         entry: "read_file".into(),

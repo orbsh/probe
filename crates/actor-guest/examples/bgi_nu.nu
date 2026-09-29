@@ -46,8 +46,14 @@ def --env interface_schema [] {
 def --env dispatch [m] {
     let args = ($m.args? | default {})
     let kind = ($m.kind? | default "call")
-    if $kind == "call" {
-        match ($m.event? | default "") {
+    let event = ($m.event? | default "")
+    # Unified seam (ADR-0036): a plain handler arrives as either kind —
+    # `call` (the carrier-internal primitive: introspection, probe-side
+    # tests) or `iterate_start` (the dispatch seam: invoke is the stream
+    # whose first round is terminal — the bare reply below is wrapped to
+    # {done:true,value} by the carrier).
+    if ($kind == "call" or $kind == "iterate_start") and $event != "stream" {
+        match $event {
             "interface_schema" => { interface_schema }
             "echo" => { {echoed: $args} }
             # nu pipelines survive the bgi shape untouched (the retired
@@ -63,7 +69,7 @@ def --env dispatch [m] {
             "count" => { $env.C = (($env.C? | default 0) + 1); {count: $env.C} }
             _ => { {error: "unknown handler"} }
         }
-    } else if $kind == "iterate_start" {
+    } else if $kind == "iterate_start" and $event == "stream" {
         $env.SG = {pulled: 1, total: ($args.total? | default 1)}
         if ($args.total? | default 1) == 0 { {done: true} } else { {item: "i0", done: false} }
     } else if $kind == "iterate_next" {
