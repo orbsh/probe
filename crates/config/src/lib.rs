@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapabilitySurface {
-    /// Carriers this node carries (e.g. ["nushell", "python"]). Registration
+    /// Carriers this node carries (e.g. ["steel", "python"]). Registration
     /// advertises these; a task naming a missing carrier is an error value.
     pub carriers: Vec<String>,
     /// Filesystem paths delivered scripts may read/write. Prefix-scoped;

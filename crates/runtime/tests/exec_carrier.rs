@@ -11,6 +11,7 @@
 use probe_runtime::carrier::session::StreamOp;
 use probe_runtime::carrier::HostBridge;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 fn bgi_bin() -> String {
@@ -283,4 +284,177 @@ fn eviction_ends_the_residency_and_sweep_clears_the_dead() {
         })
         .unwrap();
     assert_eq!(out, json!({"echoed": "after respawn"}));
+}
+
+// ----------------------------------------------------- nu bgi (two-fifo) --
+
+/// The nushell author script (ADR-0035 §8): `def main [req rep]` IS the
+/// loop; the session shape is chosen by the spawn spec's head (`nu`) and
+/// the protocol is IDENTICAL to the pipes shape — the fifos replace
+/// stdin only because nu cannot block-read a pipe.
+fn nu_bgi_spec() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../actor-guest/examples/bgi_nu.nu");
+    assert!(path.exists(), "nu bgi fixture missing: {}", path.display());
+    format!("nu {}", path.display())
+}
+
+/// Round trip over the fifo channels + residency: the `count` handler
+/// rides `$env` across calls on the SAME child (the for-loop scope rule
+/// the fixture documents — `each` would eat the writes).
+#[test]
+fn nu_bgi_call_round_trip_and_residency() {
+    let s = sessions();
+    let spec = nu_bgi_spec();
+    let call = |event: &str, args: Value| {
+        s.with_session(
+            "box/nu1",
+            "bgi",
+            &spec,
+            None,
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            move |sess| sess.call(event, &args),
+        )
+        .unwrap()
+    };
+    assert_eq!(call("echo", json!({"a": 1})), json!({"echoed": {"a": 1}}));
+    assert_eq!(call("count", json!({})), json!({"count": 1}), "$env rides the resident child");
+    assert_eq!(call("count", json!({})), json!({"count": 2}));
+    // The schema frame carries the storage block (the plan the control
+    // plane resolves at upload — ADR-0037's typed shape over the nu seam).
+    let schema = call("interface_schema", json!({}));
+    assert!(
+        schema["storage"]["collections"]["counters"]["schema"]["key_len"].is_number(),
+        "the nu fixture declares the counters collection: {schema}"
+    );
+}
+
+/// The ctx seam over the SECOND fifo: the child emits a host frame on
+/// stdout, blocks reading `rep`, the parent answers there (never on
+/// `req` — two readers on one fifo race; measured deadlock).
+#[test]
+fn nu_bgi_host_call_crosses_the_seam() {
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let bridge = {
+        let seen = seen.clone();
+        let mut b = HostBridge::default();
+        b.functions.insert(
+            "ctx_invoke".into(),
+            Arc::new(move |arg: Value| {
+                seen.lock().unwrap().push(arg.clone());
+                Ok(json!({"from": "host", "echo": arg}))
+            }) as probe_runtime::carrier::HostFn,
+        );
+        b
+    };
+    let s = sessions();
+    let spec = nu_bgi_spec();
+    let out = s
+        .with_session(
+            "box/nu2",
+            "bgi",
+            &spec,
+            Some(&bridge),
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            |sess| sess.call("ctx_round_trip", &json!({"q": 1})),
+        )
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1, "the host fn ran once");
+    assert_eq!(
+        out["invoked"]["from"], "host",
+        "the parent's rep-fifo answer reached the child: {out}"
+    );
+}
+
+/// The envelope stream over the nu adapter, guard state in `$env` —
+/// start carries the first item, exhaustion WRITES done (the same
+/// ADR-0034 shape the Rust bgi fixture locks; nu lands it with no
+/// generator language, only `$env`).
+#[test]
+fn nu_bgi_iterate_stream() {
+    let s = sessions();
+    let spec = nu_bgi_spec();
+    let pull = |op: StreamOp| -> Value {
+        s.with_session(
+            "box/nu3",
+            "bgi",
+            &spec,
+            None,
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            move |sess| sess.iterate(op.clone()),
+        )
+        .unwrap()
+    };
+    let mut envs = vec![pull(StreamOp::Start {
+        stream_id: "s1".into(),
+        handler: "stream".into(),
+        args: json!({"total": 3}),
+    })];
+    for _ in 0..4 {
+        let e = pull(StreamOp::Next {
+            stream_id: "s1".into(),
+            handler: "stream".into(),
+            args: json!({}),
+        });
+        let done = e.get("done").and_then(|d| d.as_bool()) == Some(true);
+        envs.push(e);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(envs[0], json!({"item": "i0", "done": false}));
+    assert_eq!(envs[1], json!({"item": "i1", "done": false}));
+    assert_eq!(envs[2], json!({"item": "i2", "done": false}));
+    assert_eq!(envs.last().unwrap(), &json!({"done": true}), "exhaustion writes done");
+}
+
+/// Teardown discipline of the fifo shape: eviction kills the child and
+/// removes the session dir (the blocked `open` cannot be EOF-released
+/// like a pipe — unlink alone races with the open).
+#[test]
+fn nu_bgi_eviction_reaps_the_child_and_clears_the_dir() {
+    let s = sessions();
+    let spec = nu_bgi_spec();
+    s.with_session("box/nu4", "bgi", &spec, None, &probe_runtime::sandbox::SandboxPolicy::None, |sess| {
+        sess.call("echo", &json!("x"))
+    })
+    .unwrap();
+    let got = s
+        .with_session("box/nu4", "bgi", &spec, None, &probe_runtime::sandbox::SandboxPolicy::None, |sess| {
+            let b = sess
+                .as_any()
+                .downcast_mut::<probe_runtime::carrier::exec::BgiSession>()
+                .ok_or_else(|| anyhow::anyhow!("not a bgi session"))?;
+            let pid = b.child_pid().ok_or_else(|| anyhow::anyhow!("no child"))?;
+            let dir = b
+                .session_dir()
+                .ok_or_else(|| anyhow::anyhow!("no session dir"))?
+                .to_path_buf();
+            Ok(json!({"pid": pid, "dir": dir.display().to_string()}))
+        })
+        .unwrap();
+    let pid = got["pid"].as_u64().unwrap() as i32;
+    let dir = PathBuf::from(got["dir"].as_str().unwrap());
+    assert!(dir.exists(), "the session dir exists while the child lives");
+
+    s.evict("box/nu4");
+    // Reaped: the pid is gone (ESRCH) — poll for the kernel's delivery.
+    let mut dead = false;
+    for _ in 0..200 {
+        dead = unsafe { libc::kill(pid, 0) } != 0;
+        if dead {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(dead, "the evicted nu child is reaped (pid {pid} still alive)");
+    // The session dir is removed on teardown (no fifo litter) — THIS
+    // session's dir, never a glob (parallel tests own their dirs).
+    for _ in 0..50 {
+        if !dir.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!dir.exists(), "the session dir is cleaned on teardown: {}", dir.display());
 }

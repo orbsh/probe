@@ -31,7 +31,8 @@ default = ["steel"]
 steel = ["dep:steel-core", "dep:im-rc"]
 python = ["dep:pyo3", "dep:okm-python"]
 wasmtime = ["dep:wasmtime", "dep:ciborium", "dep:base64"]
-nushell = []
+# (the nushell PTY feature retired per ADR-0035 §6 — nu rides the bgi
+# carrier's fifo adapter, which needs no feature gate: spawn + pipes only.)
 
 [dev-dependencies]
 tempfile = "3"

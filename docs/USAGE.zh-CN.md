@@ -27,7 +27,7 @@ Probe 启动顺序：
   "credential_env": "PROBE_CREDENTIAL",
   "capabilities": {
     "node_alias": "home-pc",
-    "carriers": ["steel", "python", "nushell"],
+    "carriers": ["steel", "python", "bgi"],
     "fs_scope": ["/home/user/work"],
     "command_exec": false,
     "network": "none"
@@ -49,7 +49,7 @@ Probe 发出的第一帧是 `register`；控制端必须回 `registered`。在�
 
 ```json
 { "type": "register", "node_alias": "home-pc", "credential": "tok-abc",
-  "carriers": ["steel", "python", "nushell"] }
+  "carriers": ["steel", "python", "bgi"] }
 ```
 
 ```json

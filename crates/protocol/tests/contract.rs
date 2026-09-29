@@ -8,7 +8,7 @@ fn roundtrip_call_carries_a_code_reference() {
         stream: None,
         session: "notes/7".into(),
         entry: "read_file".into(),
-        language: "nushell".into(),
+        language: "bgi".into(),
         args: serde_json::json!({ "path": "~/notes.md" }),
         code: CodeRef {
             url: "http://code.local/ab12".into(),
@@ -20,7 +20,7 @@ fn roundtrip_call_carries_a_code_reference() {
     assert_eq!(back.call_id, "c1");
     assert_eq!(back.session, "notes/7", "residency identity survives the wire");
     assert_eq!(back.entry, "read_file", "entry name survives the wire");
-    assert_eq!(back.language, "nushell");
+    assert_eq!(back.language, "bgi");
     assert_eq!(back.code.sha256, "ab12", "the frame asserts the hash");
     assert_eq!(back.code.url, "http://code.local/ab12");
 }

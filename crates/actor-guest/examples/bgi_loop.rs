@@ -46,6 +46,12 @@ fn main() {
         match (kind.as_str(), event.as_str()) {
             // Plain handler: echo the args — the invoke shape.
             ("call", "echo") => reply(&mut out, id, serde_json::json!({"echoed": args})),
+            // A genuinely slow handler (the deadline tests need real
+            // latency a hot timeout can beat): one second, synchronous.
+            ("call", "slow") => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                reply(&mut out, id, args.clone());
+            }
             // Upload-time introspection (ADR-0035: the child declares
             // its receives in its own code — the frame protocol carries
             // the same JSON schema shape every carrier's interface_schema
@@ -56,7 +62,7 @@ fn main() {
                 &mut out,
                 id,
                 serde_json::json!({
-                    "receives": { "echo": {}, "ctx_round_trip": {}, "store_round_trip": {} },
+                    "receives": { "echo": {}, "slow": {}, "ctx_round_trip": {}, "store_round_trip": {} },
                     "wildcard_receives": [],
                     "storage": { "collections": { "counters": { "schema": {
                         "key_len": 8,

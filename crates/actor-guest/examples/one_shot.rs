@@ -2,7 +2,7 @@
 //! whole stdin as one JSON request (`{"handler":..., "args":...}`),
 //! dispatch, print one JSON result, exit. Nothing survives the call —
 //! that is the definition, not a limitation (the php-fpm lineage; the
-//! SKILL shape; nushell's landing until its bgi adapter ships).
+//! SKILL shape; the bare cgi form any language runs without a loop).
 
 use serde_json::Value;
 

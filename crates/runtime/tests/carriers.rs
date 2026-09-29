@@ -51,33 +51,10 @@ fn py_missing_entry_is_error_value() {
 }
 
 // --------------------------------------------------------------- nushell --
-// Booth shape: a module exporting named functions (`def --env` for handlers
-// that write $env state). Args arrive as one parsed value; results are
-// structured and travel via files (the PTY stream is discarded).
-#[cfg(feature = "nushell")]
-#[test]
-fn nu_entry_with_args() {
-    let src = r#"
-export def double [args] {
-    { doubled: ($args.x * 2) }
-}
-"#;
-    let out = run("nushell", src, "double", &serde_json::json!({ "x": 21 })).unwrap();
-    assert_eq!(out, serde_json::json!({"doubled": 42}));
-}
-
-// Pipelines work naturally: structured data flows through nu operations.
-#[cfg(feature = "nushell")]
-#[test]
-fn nu_pipeline_result() {
-    let src = r#"
-export def sort_items [args] {
-    $args.items | sort
-}
-"#;
-    let out = run("nushell", src, "sort_items", &serde_json::json!({ "items": [3, 1, 2] })).unwrap();
-    assert_eq!(out, serde_json::json!([1, 2, 3]));
-}
+// nu has no embedded carrier (the PTY shape retired per ADR-0035 §6):
+// its booth shapes live on the bgi/exec carriers — the reference tests
+// are the `nu_bgi_*` set in exec_carrier.rs (the author script with a
+// `def main` loop over the two-fifo adapter) and the `exec` one-shot.
 
 // ----------------------------------------------------------------- steel --
 // Booth shape: definitions plus handler lambdas; args arrive as a native

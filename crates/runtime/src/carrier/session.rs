@@ -19,8 +19,8 @@ pub trait ResidentSession: Send {
     /// Invoke one handler by name with parsed JSON args.
     fn call(&mut self, handler: &str, args: &Value) -> Result<Value>;
     /// Drive one stream op (ADR-0034). Envelope-mode carriers (steel,
-    /// nushell, wasm — languages without a host-drivable generator
-    /// protocol; a Rust wasm guest maps its own `Iterator` inside the
+    /// wasm — languages without a host-drivable generator protocol; a
+    /// Rust wasm guest maps its own `Iterator` inside the
     /// module and returns the envelope at the ABI edge) delegate to
     /// `envelope_pull`; carriers with a native generator the host can
     /// park and step (python) override and never let the handler see
@@ -77,7 +77,7 @@ impl StreamOp {
 }
 
 /// The envelope-mode iteration shape (ADR-0034 §1, languages without a
-/// host-drivable generator protocol — steel, nushell, wasm): the handler
+/// host-drivable generator protocol — steel, wasm): the handler
 /// is a repeatedly callable function that returns the envelope
 /// explicitly. The framework injects `{stream_id, op}` into the args,
 /// forwards the call, and validates that the reply carries a boolean
@@ -218,26 +218,24 @@ fn spawn_session(
     host: Option<&HostBridge>,
     sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<Box<dyn ResidentSession>> {
-    // `source` is consumed by the wasmtime arm (compile at spawn) and the
-    // `sandbox` by nushell's PTY spawn; the other arms ignore one or both.
-    #[cfg_attr(not(any(feature = "wasmtime", feature = "nushell")), allow(unused_variables))]
+    // `source` is consumed by the wasmtime arm (compile at spawn); the
+    // other arms ignore it (the spawn spec is argv) or one or both.
+    #[cfg_attr(not(feature = "wasmtime"), allow(unused_variables))]
     let _ = (language, source, host, sandbox);
     Ok(match language {
         #[cfg(feature = "steel")]
         "steel" => Box::new(super::steel::SteelSession::new(host)),
         #[cfg(feature = "python")]
         "python" => Box::new(super::python::PythonSession::new(host)?),
-        #[cfg(feature = "nushell")]
-        "nushell" => Box::new(super::nushell::NushellResident::new(
-            sandbox,
-            host.map(|h| std::sync::Arc::new(h.clone())),
-        )?),
         // BGI (ADR-0035, Booth Gateway Interface — the framed resident
         // shape): the source string IS the argv (whitespace-separated,
         // quoted-free — the spawn spec); the child lives as long as the
-        // session and runs the BGI loop over the line protocol. Under a
-        // sandbox policy the whole spawn is bwrap-wrapped (the nushell
-        // PTY precedent — mount policy before exec).
+        // session and runs the BGI loop over the line protocol. A `nu`
+        // head selects the two-fifo adapter shape inside the carrier
+        // (the nushell PTY carrier retired — one execution shape per
+        // language, the nu form is `bgi` with spec `nu <author.nu>`).
+        // Under a sandbox policy the whole spawn is bwrap-wrapped (the
+        // mount policy runs before exec).
         "bgi" => {
             let argv: Vec<String> = shellish_split(source);
             Box::new(super::exec::BgiSession::spawn_wrapped(&argv, host, sandbox)?)
@@ -247,8 +245,7 @@ fn spawn_session(
         // the script's cue; nushell's `open /dev/stdin` needs exactly
         // this), stdout read whole as the result. Nothing survives the
         // call: iterate is an error value, no ctx channel exists, no
-        // residency to sweep. The SKILL shape and nushell's landing
-        // until its bgi fifo adapter ships (user ruling 2026-09-28).
+        // residency to sweep. The SKILL shape (user ruling 2026-09-28).
         "exec" => {
             let argv: Vec<String> = shellish_split(source);
             Box::new(super::exec::OneShotSession::new(&argv, sandbox))

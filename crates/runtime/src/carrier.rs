@@ -42,10 +42,6 @@ pub mod steel;
 pub mod python;
 #[cfg(feature = "wasmtime")]
 pub mod wasmtime;
-#[cfg(feature = "nushell")]
-pub mod nushell;
-#[cfg(feature = "nushell")]
-pub mod nushell_session;
 pub mod exec;
 pub mod session;
 
@@ -59,8 +55,6 @@ pub fn execute(language: &str, _req: ExecRequest) -> anyhow::Result<Value> {
         "python" => anyhow::bail!("python is resident-only: use carrier::session"),
         #[cfg(feature = "wasmtime")]
         "wasmtime" => anyhow::bail!("wasmtime is resident-only: use carrier::session"),
-        #[cfg(feature = "nushell")]
-        "nushell" => anyhow::bail!("nushell is resident-only: use carrier::session (no one-shot execution)"),
         other => anyhow::bail!("language not carried by this probe build: {other}"),
     }
 }

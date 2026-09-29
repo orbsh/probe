@@ -41,7 +41,7 @@ Order of operations at probe startup:
   "credential_env": "PROBE_CREDENTIAL",
   "capabilities": {
     "node_alias": "home-pc",
-    "carriers": ["steel", "python", "nushell"],
+    "carriers": ["steel", "python", "bgi"],
     "fs_scope": ["/home/user/work"],
     "command_exec": false,
     "network": "none"
@@ -72,7 +72,7 @@ The first frame the probe sends is `register`; the control plane must answer
 
 ```json
 { "type": "register", "node_alias": "home-pc", "credential": "tok-abc",
-  "carriers": ["steel", "python", "nushell"] }
+  "carriers": ["steel", "python", "bgi"] }
 ```
 
 ```json
