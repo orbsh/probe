@@ -7,6 +7,28 @@ use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 
+/// Adapter: the bridge's four byte-level closures (host-owned engine,
+/// ADR-0037 4.16a) behind okm-steel's `Engine` trait (re-exported from
+/// okm-entry — the single source shared with okm-python). The trait's
+/// signature is byte-for-byte the closure shapes — this arm exists to
+/// satisfy the trait, no translation happens.
+struct ClosureEngine(std::sync::Arc<super::StorageEngineFns>);
+
+impl okm_steel::okm_entry::Engine for ClosureEngine {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) {
+        (self.0.put)(key, value)
+    }
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        (self.0.get)(key)
+    }
+    fn del(&self, key: &[u8]) {
+        (self.0.del)(key)
+    }
+    fn scan_range(&self, begin: &[u8], end: Option<&[u8]>) -> Vec<Vec<u8>> {
+        (self.0.scan_range)(begin, end)
+    }
+}
+
 /// Resident steel session: one VM per booth instance. The source runs ONCE
 /// at load (with the `on` collector bound and handlers bound under event
 /// names); every later call addresses a handler by name in the SAME VM —
@@ -19,11 +41,32 @@ pub struct SteelSession {
 unsafe impl Send for SteelSession {}
 
 impl SteelSession {
-    pub fn new(host: Option<&HostBridge>) -> Self {
+    pub fn new(host: Option<&HostBridge>) -> anyhow::Result<Self> {
         let mut engine = Engine::new();
         register_host(&mut engine, host);
+        // Storage injection (ADR-0037 §1, Phase 4.16b): one Collection
+        // per declared entry over the HOST's engine, registered in the
+        // per-VM registry the six script fns read by NAME
+        // (`(collection-put! "Counters" ...)` — fixed fn names because
+        // steel resolves free identifiers at define-compile time; see
+        // okm-steel's collection.rs for the introspection-stub
+        // rationale). Drop the session, drop its collections.
+        if let Some(slot) = host.and_then(|b| b.storage.as_ref()) {
+            let reg = okm_steel::collection::StorageRegistry::default();
+            let byte_engine: std::sync::Arc<dyn okm_steel::okm_entry::Engine> =
+                std::sync::Arc::new(ClosureEngine(slot.engine.clone()));
+            for coll in &slot.collections {
+                // A failed inject is a DECLARATION error (bad entry
+                // data) — the session never starts, the same shape the
+                // python carrier's load errors with (the caller turns
+                // it into an instance error).
+                reg.inject(byte_engine.clone(), &coll.name, &coll.entry, slot.ns)
+                    .map_err(|e| anyhow::anyhow!("steel inject {}: {e}", coll.name))?;
+            }
+            reg.register_into(&mut engine);
+        }
         register_on_collector(&mut engine);
-        Self { engine }
+        Ok(Self { engine })
     }
 }
 
@@ -198,6 +241,15 @@ fn register_ctx_stubs(engine: &mut Engine) {
             Err("ctx function called during introspection (no host bridge)".to_string())
         });
     }
+    // The okm storage surface (collection fns + codec fns) follows the
+    // SAME define-compile trap: a handler referencing `(collection-put!
+    // ...)` or `(okm-encode-key! ...)` needs the names to exist at
+    // load, or the declaration is dropped silently. The stub arms
+    // error if called (introspection never calls a handler). Resident
+    // sessions get the REAL fns (SteelSession::new / okm_steel::register
+    // — never shadowed here, the same scoping rule as the ctx stubs).
+    okm_steel::collection::StorageRegistry::register_stubs(engine);
+    okm_steel::collection::register_codec_stubs(engine);
 }
 
 fn collected() -> Vec<(String, String)> {

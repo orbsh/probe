@@ -306,7 +306,7 @@ fn spawn_session(
     let _ = (language, source, host, sandbox);
     Ok(match language {
         #[cfg(feature = "steel")]
-        "steel" => Box::new(super::steel::SteelSession::new(host)),
+        "steel" => Box::new(super::steel::SteelSession::new(host)?),
         #[cfg(feature = "python")]
         "python" => Box::new(super::python::PythonSession::new(host)?),
         // BGI (ADR-0035, Booth Gateway Interface — the framed resident

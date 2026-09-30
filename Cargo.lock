@@ -2433,7 +2433,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#ce08c24a09677ac5b8c7657a2471361f42df9e2a"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
 dependencies = [
  "okm-derive",
  "okm-wire",
@@ -2448,7 +2448,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#ce08c24a09677ac5b8c7657a2471361f42df9e2a"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -2459,27 +2459,51 @@ dependencies = [
 [[package]]
 name = "okm-dynamic"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#ce08c24a09677ac5b8c7657a2471361f42df9e2a"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
 dependencies = [
  "okm-core",
 ]
 
 [[package]]
-name = "okm-python"
+name = "okm-entry"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#ce08c24a09677ac5b8c7657a2471361f42df9e2a"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
 dependencies = [
  "okm-core",
  "okm-dynamic",
+ "serde_json",
+]
+
+[[package]]
+name = "okm-python"
+version = "0.1.0"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
+dependencies = [
+ "okm-core",
+ "okm-dynamic",
+ "okm-entry",
  "okm-wire",
  "pyo3",
  "serde_json",
 ]
 
 [[package]]
+name = "okm-steel"
+version = "0.1.0"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
+dependencies = [
+ "im-rc",
+ "okm-core",
+ "okm-dynamic",
+ "okm-entry",
+ "serde_json",
+ "steel-core",
+]
+
+[[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm#ce08c24a09677ac5b8c7657a2471361f42df9e2a"
+source = "git+https://github.com/orbsh/okm#407cbe26b4402f75cba26b85b47981ef3c0caf84"
 
 [[package]]
 name = "once_cell"
@@ -2732,6 +2756,7 @@ dependencies = [
  "libc",
  "okm-core",
  "okm-python",
+ "okm-steel",
  "okm-wire",
  "probe-config",
  "probe-protocol",
@@ -4925,7 +4950,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
