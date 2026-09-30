@@ -107,6 +107,18 @@ pub fn execute(language: &str, _req: ExecRequest) -> anyhow::Result<Value> {
 /// assembles/merges `interface_schema` behind this one call — the host
 /// never knows how each language collects its declarations.
 pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
+    introspect_encoded(language, source, probe_protocol::ChannelEncoding::Json)
+}
+
+/// The declared-encoding form (ADR-0037 §2): the process carriers spawn
+/// their throwaway session in the DECLARED codec — a CBOR-declared bgi
+/// booth's `interface_schema` frame round trip must ride CBOR too, or
+/// the child would not parse the request.
+pub fn introspect_encoded(
+    language: &str,
+    source: &str,
+    encoding: probe_protocol::ChannelEncoding,
+) -> anyhow::Result<Value> {
     match language {
         #[cfg(feature = "steel")]
         "steel" => steel::introspect(source),
@@ -151,9 +163,17 @@ pub fn introspect(language: &str, source: &str) -> anyhow::Result<Value> {
         // one-shot execution path.
         _ => {
             let sessions = session::Sessions::new();
-            sessions.with_session("__introspect", language, source, None, &crate::sandbox::SandboxPolicy::None, |s: &mut dyn crate::carrier::session::ResidentSession| {
-                s.call("interface_schema", &Value::Null)
-            })
+            sessions.with_session_encoded(
+                "__introspect",
+                language,
+                source,
+                None,
+                &crate::sandbox::SandboxPolicy::None,
+                encoding,
+                |s: &mut dyn crate::carrier::session::ResidentSession| {
+                    s.call("interface_schema", &Value::Null)
+                },
+            )
         }
     }
 }

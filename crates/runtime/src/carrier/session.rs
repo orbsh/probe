@@ -229,6 +229,35 @@ impl Sessions {
         sandbox: &crate::sandbox::SandboxPolicy,
         f: impl FnOnce(&mut dyn ResidentSession) -> Result<Value>,
     ) -> Result<Value> {
+        self.with_session_encoded(
+            key,
+            language,
+            source,
+            host,
+            sandbox,
+            probe_protocol::ChannelEncoding::Json,
+            f,
+        )
+    }
+
+    /// The declared-encoding form (ADR-0037 §2 — dual-protocol): the
+    /// frame codec for the PROCESS carriers (bgi/exec). Embedded carriers
+    /// carry no channel — the encoding is inert there; `Json` is the
+    /// stdlib-reachable default every older call site rides.
+    // The session-spawn parameter set (+codec) is the shape `with_session`
+    // already carries; grouping them into a struct would churn every
+    // existing call site for no semantic gain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_session_encoded(
+        &self,
+        key: &str,
+        language: &str,
+        source: &str,
+        host: Option<&HostBridge>,
+        sandbox: &crate::sandbox::SandboxPolicy,
+        encoding: probe_protocol::ChannelEncoding,
+        f: impl FnOnce(&mut dyn ResidentSession) -> Result<Value>,
+    ) -> Result<Value> {
         let slot = {
             let mut map = self.map.lock().unwrap();
             match map.get(key) {
@@ -238,7 +267,7 @@ impl Sessions {
                     // holding the registry lock — spawn errors surface as
                     // errors, never panics, and the failed entry is not
                     // cached.
-                    let mut session = spawn_session(language, source, host, sandbox)?;
+                    let mut session = spawn_session(language, source, host, sandbox, encoding)?;
                     session.load(source)?;
                     let slot = Arc::new(Mutex::new(session));
                     map.insert(key.to_string(), slot.clone());
@@ -299,11 +328,14 @@ fn spawn_session(
     source: &str,
     host: Option<&HostBridge>,
     sandbox: &crate::sandbox::SandboxPolicy,
+    encoding: probe_protocol::ChannelEncoding,
 ) -> Result<Box<dyn ResidentSession>> {
     // `source` is consumed by the wasmtime arm (compile at spawn); the
     // other arms ignore it (the spawn spec is argv) or one or both.
+    // `encoding` is consumed by the process carriers only (bgi/exec —
+    // ADR-0037 §2); the embedded carriers have no channel.
     #[cfg_attr(not(feature = "wasmtime"), allow(unused_variables))]
-    let _ = (language, source, host, sandbox);
+    let _ = (language, source, host, sandbox, encoding);
     Ok(match language {
         #[cfg(feature = "steel")]
         "steel" => Box::new(super::steel::SteelSession::new(host)?),
@@ -320,7 +352,7 @@ fn spawn_session(
         // mount policy runs before exec).
         "bgi" => {
             let argv: Vec<String> = shellish_split(source);
-            Box::new(super::exec::BgiSession::spawn_wrapped(&argv, host, sandbox)?)
+            Box::new(super::exec::BgiSession::spawn_wrapped(&argv, host, sandbox, encoding)?)
         }
         // exec (ADR-0035 — the bare cgi shape, NO protocol): one process
         // per call — the request JSON is written, stdin closed (EOF is
@@ -330,7 +362,7 @@ fn spawn_session(
         // residency to sweep. The SKILL shape (user ruling 2026-09-28).
         "exec" => {
             let argv: Vec<String> = shellish_split(source);
-            Box::new(super::exec::OneShotSession::new(&argv, sandbox))
+            Box::new(super::exec::OneShotSession::new(&argv, sandbox, encoding))
         }
         // Wasm compiles AT SPAWN (from_source) — its `load` is a no-op;
         // other carriers load lazily inside `load`. Same session shape.

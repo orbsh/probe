@@ -156,13 +156,20 @@ async fn execute_call_inner(
     let kind = call.kind;
     let stream_id = call.stream.clone().unwrap_or_default();
     let sandbox = sandbox_policy_for(config);
+    // Copy the declared codec out — `call` is a reference and cannot
+    // enter the move-closure (the field is Copy).
+    let encoding = call.encoding;
     tokio::task::spawn_blocking(move || {
-        sessions.with_session(
+        sessions.with_session_encoded(
             &key,
             &language,
             &source,
             Some(&bridge),
             &sandbox,
+            // ADR-0037 §2: the process carriers speak the DECLARED codec;
+            // the control plane sends it with every call, embedded
+            // carriers ignore it (no channel).
+            encoding,
             // Unified seam (ADR-0036): every dispatch job is a stream
             // op — invoke is the stream whose first round is terminal
             // (plain handlers answer bare, the carrier wraps to

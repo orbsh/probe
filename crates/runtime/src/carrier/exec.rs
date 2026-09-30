@@ -8,8 +8,20 @@
 //! nushell fifo adapter (the "fcgi-adapts-cgi" move — see `BgiKind`).
 //! Frame line:
 //!   parent → child: {"id":N,"kind":"call|iterate_start|iterate_next|iterate_dispose","event":"...","op":"start|next|dispose","args":...,"stream_id":"..."}
-//!   child → parent: {"host":{"op":"ctx_invoke","args":...}} → parent answers {"host_reply":{"ok":...}}
+//!   child → parent: {"host":{"type":"invoke|iterate|store|interface_schema",…}} — TYPED frames (ADR-0037 §2): the discriminator fails at decode, never as a silent unknown-op string lookup
+//!   → parent answers {"host_reply":{"ok":...}}
 //!   child → parent: {"result":...} (terminates one request; success only — failures ride the outer Result, ADR-0012)
+//!
+//! Frame ENCODING is declared per booth (ADR-0037 §2, user ruling
+//! 2026-09-30 — dual-protocol, replacing the single-encoding plan):
+//! JSON-lines (the default, stdlib-reachable — nu rides it) or CBOR
+//! (one self-delimited document per frame; Rust guests via ciborium).
+//! The carrier speaks the declared codec on both directions and the
+//! host frame vocabulary is typed under BOTH (orthogonal axes). The
+//! child learns the encoding through the `BGI_ENCODING` env var
+//! ("json" | "cbor"; absent = json) — an env, not an appended argv:
+//! the fifo shape passes exactly [req rep] and a runtime-generated
+//! argument would break the author's `def main` arity.
 //! One outstanding host call at a time (synchronous-by-contract, like
 //! every bridge). The source string IS the argv (whitespace-split — the
 //! spawn spec; remote content-addressed binaries are a recorded
@@ -37,22 +49,82 @@
 use super::session::{ResidentSession, StreamOp};
 use super::HostBridge;
 use anyhow::{anyhow, Result};
+use probe_protocol::ChannelEncoding;
+use serde::Deserialize;
 use serde_json::Value;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+// ----------------------------------------------------------- frames --
+
+/// The typed host frame the child sends (ADR-0037 §2 — one stream, typed
+/// frames; the free-function-name lookup is retired). Deserializing the
+/// discriminator at the frame-structure layer turns a typo'd shape into a
+/// decode error (an error value back into the child), never a silent
+/// unknown-op miss in the bridge table. The store payload stays DATA —
+/// the probe never parses the okm instruction (schema-blind rule; §3's
+/// retirement is the ENTRY's retirement, not the instruction document's).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TypedHostFrame {
+    /// `ctx_invoke`: the target selection object rides as args.
+    Invoke { args: Value },
+    /// The ADR-0034 consumer legs — one frame type, the verb inside
+    /// (start carries the target selection, next/dispose the stream id).
+    Iterate { op: IterVerb, args: Value },
+    /// `ctx_store_emit`: one okm Collection instruction as data.
+    Store { op: Value },
+    /// `ctx_interface_schema`: the declared schema, no arguments.
+    InterfaceSchema {},
+}
+
+/// The iterate verb inside a typed `Iterate` frame — a wrong verb fails
+/// at decode (the typing kills the document-layer mistake, §2), never a
+/// silent fallback.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IterVerb {
+    Start,
+    Next,
+    Dispose,
+}
+
+impl TypedHostFrame {
+    /// Map onto the bridge's named-function table (the in-process carriers
+    /// register the same names; the typed frame is the process seam's
+    /// shape, not a new vocabulary). Returns (fn name, arg).
+    fn dispatch(self) -> (&'static str, Value) {
+        match self {
+            TypedHostFrame::Invoke { args } => ("ctx_invoke", args),
+            TypedHostFrame::Iterate { op, args } => (
+                match op {
+                    IterVerb::Start => "ctx_iter_start",
+                    IterVerb::Next => "ctx_iter_next",
+                    IterVerb::Dispose => "ctx_iter_dispose",
+                },
+                args,
+            ),
+            TypedHostFrame::Store { op } => ("ctx_store_emit", op),
+            TypedHostFrame::InterfaceSchema {} => ("ctx_interface_schema", Value::Null),
+        }
+    }
+}
+
 // --------------------------------------------------------------- bgi --
 
 /// One resident bgi session: the framed child, in one of two shapes.
 pub struct BgiSession {
-    /// Host functions for the child's ctx round trips, named like every
-    /// other bridge's ("ctx_invoke", "ctx_store_emit", …) — the child
-    /// sends them inside a host frame.
+    /// Host functions for the child's ctx round trips — the child sends
+    /// them inside a TYPED host frame (ADR-0037 §2), mapped to these
+    /// names at dispatch ("ctx_invoke", "ctx_store_emit", …).
     host: HostBridge,
     kind: BgiKind,
     next_id: u64,
+    /// Declared frame codec (ADR-0037 §2, dual-protocol): the channel's
+    /// encoding for the session's whole life, both directions.
+    encoding: ChannelEncoding,
 }
 
 /// The request channel differs per language's blocking-read capability:
@@ -94,16 +166,22 @@ enum BgiKind {
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl BgiSession {
-    /// Spawn and keep (no sandbox).
+    /// Spawn and keep (no sandbox, JSON-lines).
     pub fn spawn(argv: &[String], host: Option<&HostBridge>) -> Result<Self> {
-        Self::spawn_wrapped(argv, host, &crate::sandbox::SandboxPolicy::None)
+        Self::spawn_wrapped(argv, host, &crate::sandbox::SandboxPolicy::None, ChannelEncoding::Json)
     }
 
-    /// Spawn under the sandbox policy (bwrap wraps argv, §header).
+    /// Spawn under the sandbox policy (bwrap wraps argv, §header) with
+    /// the declared frame codec (ADR-0037 §2). The CBOR shape is the
+    /// pipes channel only: the fifo adapter exists FOR nushell (nu has
+    /// no CBOR codec in its stdlib — the entrance criterion routes it to
+    /// JSON), so `nu` specs are asserted Json (a CBOR-declared nu booth
+    /// is a declaration error, not a silent downgrade).
     pub fn spawn_wrapped(
         argv: &[String],
         host: Option<&HostBridge>,
         policy: &crate::sandbox::SandboxPolicy,
+        encoding: ChannelEncoding,
     ) -> Result<Self> {
         // The nushell adapter shape: `["nu", "<author.nu>"]` — the spawn
         // spec's argv head selects the channel, the protocol stays ONE.
@@ -112,9 +190,13 @@ impl BgiSession {
                 .get(1)
                 .filter(|_| argv.len() == 2)
                 .ok_or_else(|| anyhow!("bgi/nu adapter: spawn spec must be exactly [nu <author.nu>]"))?;
+            anyhow::ensure!(
+                encoding == ChannelEncoding::Json,
+                "bgi/nu adapter: nushell speaks JSON-lines only (no CBOR codec in its stdlib) — declare encoding json"
+            );
             return Self::spawn_fifo(Path::new(author), host, policy);
         }
-        let (child, stdin, reader) = spawn_child(argv, policy)?;
+        let (child, stdin, reader) = spawn_child(argv, policy, encoding)?;
         Ok(Self {
             host: host.cloned().unwrap_or_default(),
             kind: BgiKind::Pipes {
@@ -123,6 +205,7 @@ impl BgiSession {
                 reader: Some(reader),
             },
             next_id: 0,
+            encoding,
         })
     }
 
@@ -175,6 +258,7 @@ impl BgiSession {
                 rep.display().to_string(),
             ],
             policy,
+            ChannelEncoding::Json,
         )?;
         // The fifos replaced stdin as the channels; drop the pipe writer
         // (nu never reads it — leaving it open only delays child exit).
@@ -189,6 +273,9 @@ impl BgiSession {
                 dir,
             },
             next_id: 0,
+            // The fifo shape is the nu adapter — JSON by construction
+            // (asserted at the spawn entry).
+            encoding: ChannelEncoding::Json,
         })
     }
 
@@ -233,49 +320,76 @@ impl BgiSession {
         }
     }
 
-    /// One request frame in, one result out, servicing host frames in
-    /// between (the child blocks on its ctx call; we answer and keep
-    /// reading until the result arrives).
+    /// One request frame in, one result out, servicing typed host frames
+    /// in between (the child blocks on its ctx call; we answer and keep
+    /// reading until the result arrives). The frame codec is the session's
+    /// declared encoding (ADR-0037 §2, dual-protocol): JSON frames are
+    /// text lines, CBOR frames are self-delimited documents on the byte
+    /// stream — the same serde_json Value shape under both codecs (only
+    /// the codec changes; a CBOR frame carries no line terminator).
     fn exchange(&mut self, mut frame: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         frame["id"] = Value::from(id);
-        self.send(&frame.to_string())?;
+        self.send(&frame)?;
         loop {
-            let mut line = String::new();
-            let reader = match &mut self.kind {
-                BgiKind::Pipes { reader, .. } | BgiKind::Fifo { reader, .. } => reader
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("bgi carrier: no stdout"))?,
+            let msg: Value = match self.encoding {
+                ChannelEncoding::Json => {
+                    let mut line = String::new();
+                    let reader = match &mut self.kind {
+                        BgiKind::Pipes { reader, .. } | BgiKind::Fifo { reader, .. } => reader
+                            .as_mut()
+                            .ok_or_else(|| anyhow!("bgi carrier: no stdout"))?,
+                    };
+                    let n = reader
+                        .read_line(&mut line)
+                        .map_err(|e| anyhow!("bgi carrier: read: {e}"))?;
+                    if n == 0 {
+                        self.teardown();
+                        return Err(anyhow!("bgi carrier: child closed stdout (exited or crashed)"));
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    serde_json::from_str(trimmed)
+                        .map_err(|e| anyhow!("bgi carrier: malformed frame {trimmed}: {e}"))?
+                }
+                ChannelEncoding::Cbor => {
+                    // Self-delimited CBOR reading: decode_one_value from a
+                    // byte reader that blocks per byte. ciborium reports
+                    // an incomplete value as EOF on the reader, so the
+                    // natural read blocks until the document completes.
+                    let rd: &mut dyn Read = match &mut self.kind {
+                        BgiKind::Pipes { reader, .. } | BgiKind::Fifo { reader, .. } => reader
+                            .as_mut()
+                            .ok_or_else(|| anyhow!("bgi carrier: no stdout"))?,
+                    };
+                    ciborium::de::from_reader(rd)
+                        .map_err(|e| anyhow!("bgi carrier: malformed cbor frame: {e}"))?
+                }
             };
-            let n = reader
-                .read_line(&mut line)
-                .map_err(|e| anyhow!("bgi carrier: read: {e}"))?;
-            if n == 0 {
-                self.teardown();
-                return Err(anyhow!("bgi carrier: child closed stdout (exited or crashed)"));
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let msg: Value = serde_json::from_str(trimmed)
-                .map_err(|e| anyhow!("bgi carrier: malformed frame {trimmed}: {e}"))?;
             if let Some(host) = msg.get("host") {
-                // One ctx round trip: run the named host fn, answer on
-                // the reply channel. Unknown op = an error value back
-                // into the child.
-                let op = host.get("op").and_then(|v| v.as_str()).unwrap_or_default();
-                let args = host.get("args").cloned().unwrap_or(Value::Null);
-                let outcome = match self.host.functions.get(op) {
-                    Some(f) => (f)(args),
-                    None => Err(anyhow!("bgi carrier: unknown host op '{op}'")),
+                // ONE ctx round trip: the typed frame discriminates at the
+                // frame-structure layer (ADR-0037 §2) — an unknown type /
+                // verb / shape is a decode failure, an error value back
+                // into the child (no silent unknown-op table miss). The
+                // store payload is never parsed here (schema-blind).
+                let outcome = match serde_json::from_value::<TypedHostFrame>(host.clone()) {
+                    Ok(typed) => {
+                        let (name, arg) = typed.dispatch();
+                        match self.host.functions.get(name) {
+                            Some(f) => (f)(arg),
+                            None => Err(anyhow!("bgi carrier: host fn '{name}' not bridged")),
+                        }
+                    }
+                    Err(e) => Err(anyhow!("bgi carrier: bad host frame: {e}")),
                 };
                 let reply = match outcome {
                     Ok(v) => serde_json::json!({"host_reply": {"ok": v}}),
                     Err(e) => serde_json::json!({"host_reply": {"error": e.to_string()}}),
                 };
-                self.send_reply(&reply.to_string())?;
+                self.send_reply(&reply)?;
                 continue;
             }
             if let Some(result) = msg.get("result") {
@@ -285,22 +399,33 @@ impl BgiSession {
         }
     }
 
-    /// One request line onto the request channel. Pipes: append + flush
-    /// (the child's line reader wakes per newline). Fifo: write + CLOSE
-    /// — the batch EOF is what wakes the child's `open --raw $req`.
-    fn send(&mut self, line: &str) -> Result<()> {
+    /// One request frame onto the request channel. JSON: text line, pipes
+    /// append + flush (the child's line reader wakes per newline), fifo
+    /// write + CLOSE (the batch EOF is what wakes the child's
+    /// `open --raw $req`). CBOR (pipes only — the fifo shape is the nu
+    /// adapter, JSON by construction): encode the self-delimited document
+    /// and flush; no newline, no length prefix.
+    fn send(&mut self, frame: &Value) -> Result<()> {
         match &mut self.kind {
             BgiKind::Pipes { stdin, .. } => {
                 let stdin = stdin
                     .as_mut()
                     .ok_or_else(|| anyhow!("bgi carrier: stdin closed"))?;
-                writeln!(stdin, "{line}")
-                    .map_err(|e| anyhow!("bgi carrier: write request: {e}"))?;
+                match self.encoding {
+                    ChannelEncoding::Json => {
+                        writeln!(stdin, "{frame}")
+                            .map_err(|e| anyhow!("bgi carrier: write request: {e}"))?;
+                    }
+                    ChannelEncoding::Cbor => {
+                        ciborium::ser::into_writer(frame, &mut *stdin)
+                            .map_err(|e| anyhow!("bgi carrier: write cbor request: {e}"))?;
+                    }
+                }
                 stdin.flush()?;
                 Ok(())
             }
             BgiKind::Fifo { req, child, .. } => {
-                fifo_write(req, line).map_err(|e| {
+                fifo_write(req, &frame.to_string()).map_err(|e| {
                     let alive = child
                         .as_mut()
                         .map(|c| c.try_wait().ok().flatten().is_none())
@@ -314,21 +439,30 @@ impl BgiSession {
         }
     }
 
-    /// One ctx reply onto the reply channel (same shape as `send`; the
-    /// pipes reply in-band on stdin, the fifos use the second channel).
-    fn send_reply(&mut self, line: &str) -> Result<()> {
+    /// One ctx reply onto the reply channel (same codec and shape rules
+    /// as `send`; the pipes reply in-band on stdin, the fifos use the
+    /// second channel — JSON only there by construction).
+    fn send_reply(&mut self, frame: &Value) -> Result<()> {
         match &mut self.kind {
             BgiKind::Pipes { stdin, .. } => {
                 let stdin = stdin
                     .as_mut()
                     .ok_or_else(|| anyhow!("bgi carrier: stdin closed"))?;
-                writeln!(stdin, "{line}")
-                    .map_err(|e| anyhow!("bgi carrier: write host_reply: {e}"))?;
+                match self.encoding {
+                    ChannelEncoding::Json => {
+                        writeln!(stdin, "{frame}")
+                            .map_err(|e| anyhow!("bgi carrier: write host_reply: {e}"))?;
+                    }
+                    ChannelEncoding::Cbor => {
+                        ciborium::ser::into_writer(frame, &mut *stdin)
+                            .map_err(|e| anyhow!("bgi carrier: write cbor host_reply: {e}"))?;
+                    }
+                }
                 stdin.flush()?;
                 Ok(())
             }
             BgiKind::Fifo { rep, .. } => {
-                fifo_write(rep, line).map_err(|e| {
+                fifo_write(rep, &frame.to_string()).map_err(|e| {
                     anyhow!("bgi/nu adapter: write host_reply {}: {e}", rep.display())
                 })
             }
@@ -466,42 +600,71 @@ impl Drop for BgiSession {
 pub struct ExecOneShot {
     argv: Vec<String>,
     policy: crate::sandbox::SandboxPolicy,
+    encoding: ChannelEncoding,
 }
 
 impl ExecOneShot {
-    pub fn new(argv: &[String], policy: &crate::sandbox::SandboxPolicy) -> Self {
-        Self { argv: argv.to_vec(), policy: policy.clone() }
+    pub fn new(
+        argv: &[String],
+        policy: &crate::sandbox::SandboxPolicy,
+        encoding: ChannelEncoding,
+    ) -> Self {
+        Self { argv: argv.to_vec(), policy: policy.clone(), encoding }
     }
-    /// One invocation = one process = one JSON in, one JSON out.
+    /// One invocation = one process = one document in, one document out
+    /// (the codec is the declaration; the request SHAPE is protocol-free
+    /// — `{handler, args}` with no host seam either way).
     pub fn run(&self, handler: &str, args: &Value) -> Result<Value> {
-        let (mut child, stdin, mut stdout) = spawn_child(&self.argv, &self.policy)?;
+        let (mut child, mut stdin, mut stdout) =
+            spawn_child(&self.argv, &self.policy, self.encoding)?;
         let request = serde_json::json!({ "handler": handler, "args": args });
         // Write the whole request, then CLOSE — EOF is the script's cue
         // to run (and nushell's `open /dev/stdin` shape needs exactly
         // this: it delivers at writer-EOF).
-        {
-            let mut stdin = stdin;
-            stdin
-                .write_all(request.to_string().as_bytes())
-                .map_err(|e| anyhow!("exec carrier: write request: {e}"))?;
-            stdin.flush()?;
-        } // stdin drops here: the writer closes, the child sees EOF.
-        let mut out = String::new();
+        match self.encoding {
+            ChannelEncoding::Json => {
+                stdin
+                    .write_all(request.to_string().as_bytes())
+                    .map_err(|e| anyhow!("exec carrier: write request: {e}"))?;
+            }
+            ChannelEncoding::Cbor => ciborium::ser::into_writer(&request, &mut stdin)
+                .map_err(|e| anyhow!("exec carrier: write cbor request: {e}"))?,
+        }
+        stdin.flush()?;
+        // Close the writer NOW — the child sees EOF and runs (the
+        // original block-scope discipline, explicit drop keeps it).
+        drop(stdin);
+        let mut out = Vec::new();
         stdout
-            .read_to_string(&mut out)
+            .read_to_end(&mut out)
             .map_err(|e| anyhow!("exec carrier: read stdout: {e}"))?;
         let status = child
             .wait()
             .map_err(|e| anyhow!("exec carrier: wait: {e}"))?;
-        let trimmed = out.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!(
-                "exec carrier: empty stdout (exit {:?}) — a one-shot script must print its result JSON",
-                status.code()
-            );
+        match self.encoding {
+            ChannelEncoding::Json => {
+                let out = String::from_utf8_lossy(&out);
+                let trimmed = out.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!(
+                        "exec carrier: empty stdout (exit {:?}) — a one-shot script must print its result JSON",
+                        status.code()
+                    );
+                }
+                serde_json::from_str(trimmed)
+                    .map_err(|e| anyhow!("exec carrier: stdout is not one JSON document: {e}"))
+            }
+            ChannelEncoding::Cbor => {
+                if out.is_empty() {
+                    anyhow::bail!(
+                        "exec carrier: empty stdout (exit {:?}) — a one-shot script must write its result document",
+                        status.code()
+                    );
+                }
+                ciborium::de::from_reader(out.as_slice())
+                    .map_err(|e| anyhow!("exec carrier: stdout is not one CBOR document: {e}"))
+            }
         }
-        serde_json::from_str(trimmed)
-            .map_err(|e| anyhow!("exec carrier: stdout is not one JSON document: {e}"))
     }
 }
 
@@ -518,8 +681,12 @@ pub struct OneShotSession {
 }
 
 impl OneShotSession {
-    pub fn new(argv: &[String], policy: &crate::sandbox::SandboxPolicy) -> Self {
-        Self { inner: ExecOneShot::new(argv, policy) }
+    pub fn new(
+        argv: &[String],
+        policy: &crate::sandbox::SandboxPolicy,
+        encoding: ChannelEncoding,
+    ) -> Self {
+        Self { inner: ExecOneShot::new(argv, policy, encoding) }
     }
 }
 
@@ -563,10 +730,14 @@ impl ResidentSession for OneShotSession {
 
 /// Fork/exec argv[0] (or the bwrap wrapper) with piped stdio; stderr is
 /// inherited (the child's diagnostics reach the probe's log, never the
-/// result channel).
+/// result channel). The declared frame codec crosses as the
+/// `BGI_ENCODING` env ("json" | "cbor") — the child-side protocol library
+/// branches on it (an env, not an appended argv: the fifo shape passes
+/// exactly [req rep] and a generated argument would break `def main`).
 fn spawn_child(
     argv: &[String],
     policy: &crate::sandbox::SandboxPolicy,
+    encoding: ChannelEncoding,
 ) -> Result<(
     Child,
     ChildStdin,
@@ -611,6 +782,15 @@ fn spawn_child(
             c
         }
     };
+    // bwrap inherits the parent environment (--clearenv is not part of
+    // the generated command), so the codec crosses the jail edge either way.
+    cmd.env(
+        "BGI_ENCODING",
+        match encoding {
+            ChannelEncoding::Json => "json",
+            ChannelEncoding::Cbor => "cbor",
+        },
+    );
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

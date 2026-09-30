@@ -6,7 +6,8 @@
 # entry function is the hand-written shape every language without a
 # runtime name lookup uses (the dispatch-table ruling 2026-09-29).
 # Host ctx calls ride literal-name defs (the author's own helpers; the
-# op names are the carrier's fixed vocabulary).
+# frame is TYPED — the discriminator `type`, ADR-0037 §2; JSON encoding
+# only: nu's stdlib has no CBOR codec, the entrance criterion).
 #
 # Pitfalls measured on this shape (do not "simplify" them away):
 # - the reply fifo is a SECOND channel: two readers on one fifo race the
@@ -16,13 +17,13 @@
 #   `for` (block scope, persists), the PTY carrier's residency rule.
 
 def ctx-invoke [args] {
-    print ({host: {op: "ctx_invoke", args: $args}} | to json --raw)
+    print ({host: {type: "invoke", args: $args}} | to json --raw)
     let rep = (open --raw $env.BGI_REP | lines | first | from json)
     $rep.host_reply.ok? | default {__error: ($rep.host_reply.error? | default "")}
 }
 
 def ctx-store-emit [instruction] {
-    print ({host: {op: "ctx_store_emit", args: $instruction}} | to json --raw)
+    print ({host: {type: "store", op: $instruction}} | to json --raw)
     let rep = (open --raw $env.BGI_REP | lines | first | from json)
     $rep.host_reply.ok? | default {__error: ($rep.host_reply.error? | default "")}
 }

@@ -477,3 +477,169 @@ fn nu_bgi_eviction_reaps_the_child_and_clears_the_dir() {
     }
     assert!(!dir.exists(), "the session dir is cleaned on teardown: {}", dir.display());
 }
+
+// ------------------------------------------------- ADR-0037 §2 locks --
+
+/// The declared CBOR codec crosses the bgi pipes channel: the parent
+/// writes self-delimited CBOR documents, the child decodes them and
+/// answers the same way — the echo round trip works with NO line
+/// protocol in between (the frame shape is unchanged; only the codec
+/// differs).
+#[test]
+fn bgi_cbor_round_trip() {
+    use probe_protocol::ChannelEncoding;
+    let s = sessions();
+    let argv = bgi_bin();
+    let out = s
+        .with_session_encoded(
+            "box/cbor1",
+            "bgi",
+            &argv,
+            None,
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            ChannelEncoding::Cbor,
+            |sess| sess.call("echo", &json!({"x": 1})),
+        )
+        .unwrap();
+    assert_eq!(out, json!({"echoed": {"x": 1}}), "CBOR frames round trip");
+
+    // Residency holds across calls on the same codec (one child).
+    let out2 = s
+        .with_session_encoded(
+            "box/cbor1",
+            "bgi",
+            &argv,
+            None,
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            ChannelEncoding::Cbor,
+            |sess| sess.iterate(StreamOp::Start {
+                stream_id: "cs1".into(),
+                handler: "count".into(),
+                args: json!({"total": 2}),
+            }),
+        )
+        .unwrap();
+    assert_eq!(out2["item"], "i0", "the second call rides the same child");
+}
+
+/// The CBOR ctx seam: the child sends a TYPED host frame (CBOR), the
+/// parent decodes it into the typed enum, runs the bridge fn, answers
+/// with a CBOR host_reply — the whole duplex on the binary codec.
+#[test]
+fn bgi_cbor_host_call_crosses_the_seam() {
+    use probe_protocol::ChannelEncoding;
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let bridge = {
+        let seen = seen.clone();
+        let mut b = HostBridge::default();
+        b.functions.insert(
+            "ctx_invoke".into(),
+            Arc::new(move |arg: Value| {
+                seen.lock().unwrap().push(arg.clone());
+                Ok(json!({"from": "host", "echo": arg}))
+            }) as probe_runtime::carrier::HostFn,
+        );
+        b
+    };
+    let s = sessions();
+    let argv = bgi_bin();
+    let out = s
+        .with_session_encoded(
+            "box/cbor2",
+            "bgi",
+            &argv,
+            Some(&bridge),
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            ChannelEncoding::Cbor,
+            |sess| sess.call("ctx_round_trip", &json!({"q": 1})),
+        )
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1, "the host fn ran once");
+    assert_eq!(out["from"], "host", "the CBOR answer reached the child: {out}");
+}
+
+/// The typing kills the document-layer mistake (ADR-0037 §2): a child
+/// sending the RETIRED untyped shape (`{"op": "ctx_invoke"}` with no
+/// discriminator) fails at the parent's typed-frame DECODE — the bridge
+/// fn never runs, and the child sees an error reply (no `ok`). The free
+/// op-name lookup that silently missed the table is gone.
+#[test]
+fn bgi_untyped_host_frame_fails_at_decode() {
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let bridge = {
+        let seen = seen.clone();
+        let mut b = HostBridge::default();
+        b.functions.insert(
+            "ctx_invoke".into(),
+            Arc::new(move |arg: Value| {
+                seen.lock().unwrap().push(arg.clone());
+                Ok(json!({"from": "host"}))
+            }) as probe_runtime::carrier::HostFn,
+        );
+        b
+    };
+    let s = sessions();
+    let argv = bgi_bin();
+    let out = s
+        .with_session(
+            "box/untyped",
+            "bgi",
+            &argv,
+            Some(&bridge),
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            |sess| sess.call("bad_host_frame", &json!({"q": 1})),
+        )
+        .unwrap();
+    assert!(seen.lock().unwrap().is_empty(), "the bridge fn must NOT run on an untyped frame");
+    // The parent's error reply carries no `ok` — the child's helper
+    // lands the recorded note (the error value crossed the seam).
+    assert!(
+        out.get("note").is_some() || out.get("error").is_some(),
+        "the decode failure surfaced as an error value, got: {out}"
+    );
+}
+
+/// exec (the bare cgi shape) rides the SAME declared codec (ADR-0037
+/// §2): one CBOR document in (stdin closed), one CBOR document out —
+/// protocol-free shape, binary codec.
+#[test]
+fn exec_cbor_round_trip() {
+    use probe_protocol::ChannelEncoding;
+    let s = sessions();
+    let argv = one_shot_bin();
+    let out = s
+        .with_session_encoded(
+            "box/exec-cbor",
+            "exec",
+            &argv,
+            None,
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            ChannelEncoding::Cbor,
+            |sess| sess.call("echo", &json!({"n": 1})),
+        )
+        .unwrap();
+    assert_eq!(out, json!({"echoed": {"n": 1}}), "one-shot CBOR round trip");
+}
+
+/// A CBOR declaration against the nushell fifo shape is a DECLARATION
+/// ERROR, not a silent downgrade (nu has no CBOR codec — the entrance
+/// criterion routes it to JSON; the spec must say so).
+#[test]
+fn nu_cbor_declaration_is_an_error() {
+    use probe_protocol::ChannelEncoding;
+    let s = sessions();
+    let spec = nu_bgi_spec();
+    let err = s
+        .with_session_encoded(
+            "box/nu-cbor-bad",
+            "bgi",
+            &spec,
+            None,
+            &probe_runtime::sandbox::SandboxPolicy::None,
+            ChannelEncoding::Cbor,
+            |sess| sess.call("echo", &json!({})),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("JSON-lines only"), "named the codec conflict: {err}");
+}

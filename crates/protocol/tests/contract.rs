@@ -1,4 +1,4 @@
-use probe_protocol::{CodeRef, ToolCall};
+use probe_protocol::{ChannelEncoding, CodeRef, ToolCall};
 
 #[test]
 fn roundtrip_call_carries_a_code_reference() {
@@ -9,6 +9,7 @@ fn roundtrip_call_carries_a_code_reference() {
         session: "notes/7".into(),
         entry: "read_file".into(),
         language: "bgi".into(),
+        encoding: ChannelEncoding::Json,
         args: serde_json::json!({ "path": "~/notes.md" }),
         code: CodeRef {
             url: "http://code.local/ab12".into(),
