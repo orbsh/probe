@@ -1,12 +1,38 @@
 //! Python carrier (PyO3, in-process CPython, zero IPC).
 
 use super::session::StreamOp;
-use super::{ExecResult, HostBridge, HostFn};
+use super::{ExecResult, HostBridge, HostFn, StorageEngineFns};
 use std::collections::HashMap;
 use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
 use serde_json::Value;
+
+/// Adapter: the bridge's four byte-level closures (host-owned engine,
+/// ADR-0037 4.16a) behind okm-python's `Engine` trait. The trait's
+/// signature is byte-for-byte the closure shapes — this arm exists to
+/// satisfy the trait, no translation happens. The engine handle never
+/// crosses a seam back: `Collection::with_store` runs HERE, under the
+/// load step, and the pyclass instance goes straight into the module
+/// (a pyclass carries `*mut PyObject` registration data — not Send —
+/// so an intermediate `Vec<(String, Collection)>` return would fight
+/// the Send bound for nothing).
+struct ClosureEngine(std::sync::Arc<StorageEngineFns>);
+
+impl okm::pyo3_impl::Engine for ClosureEngine {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) {
+        (self.0.put)(key, value)
+    }
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        (self.0.get)(key)
+    }
+    fn del(&self, key: &[u8]) {
+        (self.0.del)(key)
+    }
+    fn scan_range(&self, begin: &[u8], end: Option<&[u8]>) -> Vec<Vec<u8>> {
+        (self.0.scan_range)(begin, end)
+    }
+}
 
 /// Compile `source` and execute it at import time with the `@on` collector
 /// already bound — decorators append `(event, key)` pairs to the returned
@@ -128,8 +154,27 @@ def ctx_iterate(booth_type, booth_key, handler, args=None):
     // receives/wildcard_receives + whatever the explicit half adds
     // (lifecycle, ...). One `interface_schema` name on the module either
     // way — aura's call path is uniform across languages.
+    //
+    // The storage block is assembled HERE (load time, right after the
+    // body — the `@DocumentEncode` classes are intact) and captured as
+    // DATA, NOT re-evaluated at schema-call time: the python injection
+    // face (ADR-0037 4.16a) registers the host-built `Collection`
+    // pyclasses into this SAME module namespace, replacing the class
+    // names (that IS the author's binding face — `Counters.put`). A late
+    // `assemble_module(globals())` would then see pyclass instances, no
+    // classes, and assemble an empty block — introspection would silently
+    // lose the storage half. Load-time capture kills that ordering trap.
+    let module_dict_at_load = module.dict();
+    let storage_at_load = {
+        let storage_py = py.eval(
+            CString::new("assemble_module(globals())")?.as_c_str(),
+            Some(&module_dict_at_load),
+            Some(&module_dict_at_load),
+        )?;
+        json_from_py(py, &storage_py)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+    };
     let reg_handle: Py<PyList> = registry.clone().unbind();
-    let module_handle2 = module.clone().unbind();
     let explicit_fn: Option<Py<PyAny>> = module
         .getattr("interface_schema")
         .ok()
@@ -159,19 +204,12 @@ def ctx_iterate(booth_type, booth_key, handler, args=None):
             ("receives".to_string(), Value::Object(receives)),
             ("wildcard_receives".to_string(), Value::Array(wildcards)),
         ].into_iter().collect());
-        // Decorator-derived storage half: assemble every
-        // `@DocumentEncode` class on the module (the okm DSL) into
-        // CollectionSchema serde JSON. Empty block omitted so it cannot
-        // shadow an explicit-only storage declaration (merge_schema's
-        // or_insert keeps the first key seen).
-        let module_dict = module_handle2.bind(py).dict();
-        let storage_py = py.eval(
-            CString::new("assemble_module(globals())")?.as_c_str(),
-            Some(&module_dict),
-            Some(&module_dict),
-        )?;
-        let storage = json_from_py(py, &storage_py)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Decorator-derived storage half: the load-time capture (see
+        // above — assembled before injection could shadow the classes).
+        // Empty block omitted so it cannot shadow an explicit-only
+        // storage declaration (merge_schema's or_insert keeps the first
+        // key seen).
+        let storage = storage_at_load.clone();
         if let Value::Object(colls) = &storage {
             if let Some(colls) = colls.get("collections").and_then(|c| c.as_object()) {
                 if !colls.is_empty() {
@@ -255,6 +293,27 @@ impl super::session::ResidentSession for PythonSession {
                         Ok::<_, pyo3::PyErr>(json_to_py(py, &out)?.unbind())
                     })?;
                     module.add(name.as_str(), call)?;
+                }
+            }
+            // Storage injection (ADR-0037 4.16a): one Collection per
+            // declared entry over the HOST's engine, registered into the
+            // module namespace under the collection name — the script
+            // writes plain `Counters.put(...)` against the realm store,
+            // zero translation. Built HERE (engine handle never crosses
+            // a seam back): the pyclass goes straight into `module.add`.
+            if let Some(slot) = self.host.as_ref().and_then(|b| b.storage.as_ref()) {
+                let engine: std::sync::Arc<dyn okm::pyo3_impl::Engine> =
+                    std::sync::Arc::new(ClosureEngine(slot.engine.clone()));
+                for coll in &slot.collections {
+                    let table = okm::pyo3_impl::Collection::with_store(
+                        engine.clone(),
+                        &coll.entry,
+                        slot.ns,
+                    )
+                    .map_err(|e| anyhow::anyhow!(
+                        "inject collection {}: {e}", coll.name
+                    ))?;
+                    module.add(coll.name.as_str(), table)?;
                 }
             }
             self.module = Some(module.unbind());

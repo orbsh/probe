@@ -13,11 +13,55 @@ use serde_json::Value;
 /// carrier only marshals values across the VM boundary.
 pub type HostFn = std::sync::Arc<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
 
+/// The host-injected byte-level engine face (ADR-0037 4.16a). FOUR
+/// closures in okm's `VirtualStorage` shapes — bytes in, bytes out.
+/// The slot carries NO okm/aura types on purpose: the contract is
+/// rev-independent, which is what lets the host (aura) hold a
+/// different okm build than the binding (okm-python) without the
+/// cross-repo type identity question ever arising. Semantics mirror
+/// okm's engine rules: ordered keys, `None` end = unbounded,
+/// scan returns FULL keys (the caller's coordinate space).
+pub type PutFn = std::sync::Arc<dyn Fn(Vec<u8>, Vec<u8>) + Send + Sync>;
+pub type GetFn = std::sync::Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
+pub type DelFn = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+pub type ScanRangeFn = std::sync::Arc<dyn Fn(&[u8], Option<&[u8]>) -> Vec<Vec<u8>> + Send + Sync>;
+
+pub struct StorageEngineFns {
+    pub put: PutFn,
+    pub get: GetFn,
+    pub del: DelFn,
+    pub scan_range: ScanRangeFn,
+}
+
+/// One declared collection of the injection slot: the RAW entry shape
+/// `Collection::with_store` consumes —
+/// `{ "schema": <CollectionSchema serde>, "indexes": [...], "reduces": [...] }`
+/// (ns NOT in the entry — the DSL's rule; the slot binds it).
+pub struct StorageCollection {
+    pub name: String,
+    pub entry: serde_json::Value,
+}
+
+/// The python carrier's storage injection slot (ADR-0037 §1): the
+/// host's live engine behind the byte face + the type's declared
+/// collections. The carrier's load step builds one `Collection` per
+/// entry over this engine and registers it into the module namespace
+/// under the collection name — the script's binding face, zero
+/// translation. Other carriers ignore the slot (steel envelope ops
+/// ride `ctx_store_emit`; wasmtime rides its own raw `emit` HostFn).
+pub struct StorageSlot {
+    pub ns: u16,
+    pub collections: Vec<StorageCollection>,
+    pub engine: std::sync::Arc<StorageEngineFns>,
+}
+
 /// Named host functions for one execution. `None` = pure operation
 /// (no host contact), the current default.
 #[derive(Clone, Default)]
 pub struct HostBridge {
     pub functions: std::collections::BTreeMap<String, HostFn>,
+    /// Storage injection (python carrier only; `None` = no collections).
+    pub storage: Option<std::sync::Arc<StorageSlot>>,
 }
 
 pub struct ExecRequest<'a> {
